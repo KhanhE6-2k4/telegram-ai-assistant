@@ -1,0 +1,8 @@
+# Chỉ gửi cho Docker đúng những gì Dockerfile chép vào image (requirements.txt, bot/). Khoá (.env,
+# credentials.json) và dữ liệu (data/) đưa vào lúc chạy bằng --env-file và -v, không nằm trong image.
+# Dockerfile chép thêm tệp / thư mục nào thì thêm dòng "!<tên>" tương ứng ở đây.
+*
+!requirements.txt
+!bot/
+**/__pycache__
+**/*.py[cod]

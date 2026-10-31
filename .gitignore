@@ -1,0 +1,49 @@
+# Khoá, token, cấu hình bí mật
+.env
+.env.*
+!.env.example
+credentials*.json
+*service-account*.json
+client_secret*.json
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Dữ liệu nội bộ của bot (DB_PATH đổi được nên chặn theo đuôi tệp), log
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+logs/
+*.log
+instance.port
+
+# Môi trường ảo, thư viện, cache Python
+.venv/
+.venv-app/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Briefcase: môi trường dev, khung app, bộ cài
+.briefcase/
+*.dist-info/
+build/
+dist/
+*.msi
+
+# Thiết lập cá nhân của IDE / Claude Code, rác hệ điều hành
+.vscode/
+.idea/
+.claude/settings.local.json
+Thumbs.db
+desktop.ini
+.DS_Store

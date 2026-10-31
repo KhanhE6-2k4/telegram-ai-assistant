@@ -1,0 +1,52 @@
+# Đóng gói app desktop bằng Briefcase (chỉ Windows). Bản dòng lệnh / Docker dùng requirements.txt.
+#
+# ⚠️ KHÔNG đổi `bundle`, `author` và `formal_name` sau khi đã phát hành: chúng quyết định thư mục dữ
+# liệu (%LOCALAPPDATA%\<author>\<formal_name>\...) và tên trong Credential Manager. Đổi thì bản cài
+# mới sẽ không thấy cấu hình, khoá và lịch sử cũ.
+[tool.briefcase]
+# Tên theo chuẩn PEP 621 (chữ thường, không dấu cách). Tên hiển thị của app là formal_name bên dưới.
+project_name = "telegram-bot"
+bundle = "vn.ant"
+version = "0.1.0"
+author = "khanhpl2op04"
+license = "LicenseRef-Proprietary"
+license-files = ["LICENSE"]
+
+[tool.briefcase.app.telegram_bot]
+formal_name = "Telegram Bot"
+description = "Ghi task từ nhóm Telegram lên Google Sheet và tóm tắt hội thoại bằng LLM"
+sources = ["telegram_bot", "bot"]
+test_sources = ["tests"]
+requires = [
+    "python-telegram-bot[job-queue]==21.6",
+    "anthropic>=2.3",
+    "openai>=3.41",
+    "gspread>=6.0",
+    "keyring>=25",
+    "tzdata",
+]
+test_requires = [
+    "pytest",
+]
+# Logo của app (đã có). Windows cần resources/icon.ico gồm các cỡ 16, 32, 48, 64, 256 px;
+# Briefcase tự thêm đuôi .ico, nên ở đây ghi không có đuôi.
+icon = "resources/icon"
+
+[tool.briefcase.app.telegram_bot.windows]
+requires = [
+    "toga-winforms==0.5.7",
+]
+# Chuỗi trong bộ cài MSI phải nằm trong code page 1252 (cp1258 cũng không chứa chữ tiếng Việt dựng sẵn):
+# - description hiện ở chú thích shortcut trong Start menu, nên không dấu;
+# - LICENSE.rtf là bản RTF của LICENSE, chữ có dấu viết dạng \uN? (chỉ ký tự ASCII). Sửa LICENSE thì
+#   sửa cả LICENSE.rtf. Briefcase tự chuyển LICENSE sang RTF thì giữ nguyên UTF-8 và WiX báo lỗi WIX0311.
+description = "Ghi task tu nhom Telegram len Google Sheet va tom tat hoi thoai bang LLM"
+license-files = ["LICENSE.rtf"]
+# Cài theo người dùng (không cần quyền admin), vào %LOCALAPPDATA%\Programs
+system_installer = false
+# Shortcut trên màn hình chính (ngoài shortcut trong Start menu). Bộ cài có ô "Create a desktop shortcut",
+# tích sẵn; cài im lặng (msiexec /qn) cũng tạo. Gỡ app thì MSI tự xoá shortcut. Đổi giá trị này thì phải
+# chạy lại `briefcase create windows` (`briefcase update` không sinh lại tệp .wxs của bộ cài).
+create_desktop_shortcut = true
+# Bộ cài gọi trước khi gỡ: báo app đang chạy thoát, xoá khoá tự khởi động, hỏi có xoá dữ liệu không
+pre_uninstall_script = "packaging/windows/pre_uninstall.bat"

@@ -93,3 +93,30 @@ def test_missing_lists_what_blocks_starting(store, tmp_path):
     store.import_credentials(write_sa(tmp_path / "key.json"))
     assert store.missing(Settings("anthropic", "", "SHEET")) == []
     assert store.missing(Settings("openai", "m", "SHEET")) == ["OpenAI API key"]
+
+
+def test_userbot_secrets_and_config(store):
+    from telegram_bot.settings import valid_api_id
+
+    store.set_secret("telegram_bot_token", "123:abc")
+    settings = Settings("anthropic", "", "SHEET")
+    # Chưa nhập API ID / Hash: không có userbot (chế độ dự phòng), không bị coi là thiếu cấu hình
+    assert store.telegram_api() == ("", "") and not store.to_config(settings).userbot_configured
+    assert "Telegram API ID" not in " ".join(store.missing(settings))
+
+    store.set_secret("telegram_api_id", "1234567")
+    store.set_secret("telegram_api_hash", "abcdef")
+    store.set_secret("userbot_session", "SESSION")
+    config = store.to_config(settings)
+    assert config.userbot_configured
+    assert (config.telegram_api_id, config.telegram_api_hash, config.userbot_session) == (1234567, "abcdef", "SESSION")
+    assert "SESSION" not in repr(config)  # session không lộ khi in Config
+    # Giá trị truyền vào (đang nhập trên form) được ưu tiên; session rỗng = chưa đăng nhập
+    config = store.to_config(settings, telegram_api=("7", "h"), userbot_session="")
+    assert (config.telegram_api_id, config.telegram_api_hash, config.userbot_session) == (7, "h", None)
+    # API ID sai dạng: bỏ qua userbot
+    assert not store.to_config(settings, telegram_api=("abc", "h"), userbot_session="S").userbot_configured
+
+    assert valid_api_id(" 123 ") and not valid_api_id("12a") and not valid_api_id("")
+    store.delete_all_secrets()
+    assert store.secrets.store == {}

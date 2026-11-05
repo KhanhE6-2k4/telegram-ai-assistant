@@ -107,10 +107,12 @@ async def run_tool_loop(
     execute: Callable[[ToolCall], Awaitable[str]],
     max_rounds: int,
     max_tokens: int = 4000,
+    history: Sequence[ChatMessage] = (),
 ) -> str | None:
     """Vòng gọi công cụ: hỏi model, chạy các công cụ nó yêu cầu, gửi kết quả lại, đến khi model
-    trả lời không kèm công cụ. Trả về câu trả lời cuối, hoặc None nếu vượt quá max_rounds."""
-    messages = [ChatMessage.user(prompt)]
+    trả lời không kèm công cụ. Trả về câu trả lời cuối, hoặc None nếu vượt quá max_rounds.
+    `history`: các lượt hội thoại trước (ngữ cảnh), gửi trước `prompt`."""
+    messages = [*history, ChatMessage.user(prompt)]
     for _ in range(max_rounds):
         response = await llm.complete(system=system, messages=messages, tools=tools, max_tokens=max_tokens)
         if not response.tool_calls:

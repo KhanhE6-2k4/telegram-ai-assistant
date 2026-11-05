@@ -24,7 +24,7 @@ KEEP_RECENT_RAW = 30
 MAX_SHEET_ROWS_IN_PROMPT = 300
 MAX_TASK_ROUNDS = 10
 
-TASK_SYSTEM_PROMPT = """Bạn là trợ lý quản lý task cho một nhóm chat Telegram làm việc.
+TASK_SYSTEM_PROMPT = """Bạn là trợ lý quản lý task cho một cuộc trò chuyện Telegram làm việc (nhóm chat hoặc chat riêng).
 Bạn nhận: danh sách task hiện có trên Google Sheet (mỗi task định danh bằng STT), bản tóm tắt
 hội thoại trước đó của ngày {day}, và các tin nhắn mới. Hãy cập nhật sheet bằng công cụ.
 
@@ -92,7 +92,7 @@ TASK_TOOLS = [
     ),
 ]
 
-SUMMARY_SYSTEM_PROMPT = """Bạn là trợ lý ghi chép cho một nhóm chat Telegram làm việc.
+SUMMARY_SYSTEM_PROMPT = """Bạn là trợ lý ghi chép cho một cuộc trò chuyện Telegram làm việc (nhóm chat hoặc chat riêng).
 Nhiệm vụ: cập nhật bản tóm tắt hội thoại của ngày {day}.
 
 - Viết bằng tiếng Việt, ngắn gọn, theo thứ tự thời gian, nêu ai nói/quyết định gì.
@@ -251,7 +251,7 @@ async def process_day(
     )
     storage.save_summary(updated)
     storage.clear_edit_pending([m.id for m in batch if m.edit_pending])
-    log.info("Đã xử lý %d tin nhắn của chat %s ngày %s", len(batch), chat_id, day)
+    log.info("Đã xử lý %d tin nhắn của chat %s ngày %s", len(batch), storage.chat_label(chat_id), day)
     return updated
 
 

@@ -1,6 +1,8 @@
 """Lưu tin nhắn và bản tóm tắt theo ngày trong SQLite.
 
-Mỗi nhóm chat (chat_id) có:
+Bảng chats: tên chat gần nhất (đặt tên tab) và cờ tracked (userbot theo dõi / bổ sung tin của chat này).
+
+Mỗi chat (nhóm hoặc chat riêng, chat_id) có:
 - bảng messages: toàn bộ tin nhắn gốc, gắn nhãn ngày (day = YYYY-MM-DD theo múi giờ cấu hình).
   edit_pending = 1 nghĩa là tin đã được nén rồi nhưng sau đó bị sửa, cần đưa lại vào lần xử lý tới.
 - bảng day_summaries: một dòng cho mỗi (chat_id, day), gồm bản tóm tắt và mốc compacted_until
@@ -17,7 +19,9 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS chats (
     chat_id     INTEGER PRIMARY KEY,
     title       TEXT,
-    updated_at  TEXT NOT NULL
+    updated_at  TEXT NOT NULL,
+    tracked     INTEGER NOT NULL DEFAULT 0,
+    username    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -61,6 +65,14 @@ CREATE TABLE IF NOT EXISTS sheet_reviews (
     reviewed_at  TEXT NOT NULL
 );
 """
+
+
+def format_chat(chat_id: int, title: str | None, username: str | None) -> str:
+    """Nhãn chat cho log: '"Team Dev" (@teamdev, -1001234)', thiếu username thì '"Team Dev" (-1001234)',
+    chưa biết tên thì chỉ chat id."""
+    if not title:
+        return f"@{username} ({chat_id})" if username else str(chat_id)
+    return f'"{title}" (@{username}, {chat_id})' if username else f'"{title}" ({chat_id})'
 
 
 @dataclass
@@ -116,20 +128,89 @@ class Storage:
                 "SELECT chat_id, stt, MIN(day), MAX(day) FROM sheet_tasks GROUP BY chat_id, stt"
             )
             self.conn.execute("DROP TABLE sheet_tasks")
+        # Cờ tracked (userbot): mọi chat bot đã biết từ trước đều được theo dõi
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(chats)")}
+        if "tracked" not in cols:
+            self.conn.execute("ALTER TABLE chats ADD COLUMN tracked INTEGER NOT NULL DEFAULT 0")
+            self.conn.execute("UPDATE chats SET tracked = 1")
+            self.conn.execute(
+                "INSERT OR IGNORE INTO chats (chat_id, title, updated_at, tracked) "
+                "SELECT DISTINCT chat_id, NULL, ?, 1 FROM messages",
+                (datetime.now(timezone.utc).isoformat(),),
+            )
+        # Username của chat (nhóm công khai / người kia trong chat riêng), để log dễ đọc
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(chats)")}
+        if "username" not in cols:
+            self.conn.execute("ALTER TABLE chats ADD COLUMN username TEXT")
         self.conn.commit()
 
-    def upsert_chat(self, chat_id: int, title: str | None) -> None:
+    def upsert_chat(self, chat_id: int, title: str | None, username: str | None = None) -> None:
+        """Lưu tên chat; username bỏ trống thì giữ username cũ."""
         self.conn.execute(
-            "INSERT INTO chats (chat_id, title, updated_at) VALUES (?, ?, ?) "
-            "ON CONFLICT (chat_id) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at",
-            (chat_id, title, datetime.now(timezone.utc).isoformat()),
+            "INSERT INTO chats (chat_id, title, updated_at, username) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT (chat_id) DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at, "
+            "username = COALESCE(excluded.username, chats.username)",
+            (chat_id, title, datetime.now(timezone.utc).isoformat(), username),
         )
         self.conn.commit()
+
+    def track_chat(self, chat_id: int, title: str | None, username: str | None = None) -> bool:
+        """Lưu tên chat (bỏ trống thì giữ tên / username cũ) và đánh dấu theo dõi. True nếu trước đó chưa theo dõi."""
+        row = self.conn.execute("SELECT tracked FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
+        self.conn.execute(
+            "INSERT INTO chats (chat_id, title, updated_at, tracked, username) VALUES (?, ?, ?, 1, ?) "
+            "ON CONFLICT (chat_id) DO UPDATE SET title = COALESCE(excluded.title, chats.title), "
+            "updated_at = excluded.updated_at, tracked = 1, username = COALESCE(excluded.username, chats.username)",
+            (chat_id, title, datetime.now(timezone.utc).isoformat(), username),
+        )
+        self.conn.commit()
+        return row is None or not row["tracked"]
+
+    def untrack_chat(self, chat_id: int) -> None:
+        self.conn.execute("UPDATE chats SET tracked = 0 WHERE chat_id = ?", (chat_id,))
+        self.conn.commit()
+
+    def tracked_chats(self) -> list[int]:
+        return [r["chat_id"] for r in self.conn.execute("SELECT chat_id FROM chats WHERE tracked = 1")]
+
+    def last_sent_at(self, chat_id: int, before: datetime | None = None) -> datetime | None:
+        """Thời điểm gửi của tin mới nhất đã lưu (chỉ xét tin gửi trước `before` nếu có)."""
+        if before is None:
+            row = self.conn.execute("SELECT MAX(sent_at) AS t FROM messages WHERE chat_id = ?", (chat_id,)).fetchone()
+        else:
+            row = self.conn.execute(
+                "SELECT MAX(sent_at) AS t FROM messages WHERE chat_id = ? AND sent_at < ?",
+                (chat_id, before.isoformat()),
+            ).fetchone()
+        return datetime.fromisoformat(row["t"]) if row["t"] else None
+
+    def pending_days(self, chat_id: int) -> list[str]:
+        """Các ngày của chat còn tin chưa xử lý (chưa nén hoặc bị sửa sau khi nén), cũ trước."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT m.day FROM messages m "
+            "LEFT JOIN day_summaries s ON s.chat_id = m.chat_id AND s.day = m.day "
+            "WHERE m.chat_id = ? AND (m.id > COALESCE(s.compacted_until, 0) OR m.edit_pending = 1) ORDER BY m.day",
+            (chat_id,),
+        ).fetchall()
+        return [r["day"] for r in rows]
 
     def chat_title(self, chat_id: int) -> str | None:
         """Tên nhóm gần nhất bot thấy (cập nhật theo mỗi tin nhắn)."""
         row = self.conn.execute("SELECT title FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
         return row["title"] if row else None
+
+    def chat_label(self, chat_id: int) -> str:
+        """Nhãn của chat cho log: tên, username (nếu có) và chat id (xem format_chat)."""
+        row = self.conn.execute("SELECT title, username FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
+        return format_chat(chat_id, row["title"] if row else None, row["username"] if row else None)
+
+    def tracked_groups(self) -> list[tuple[int, str, str | None]]:
+        """Các nhóm đang theo dõi (chat id âm), tên A-Z: (chat_id, tên, username)."""
+        rows = self.conn.execute(
+            "SELECT chat_id, title, username FROM chats WHERE tracked = 1 AND chat_id < 0 AND title IS NOT NULL "
+            "ORDER BY title COLLATE NOCASE"
+        ).fetchall()
+        return [(r["chat_id"], r["title"], r["username"]) for r in rows]
 
     # ---- tin nhắn ----
 
@@ -186,8 +267,10 @@ class Storage:
         Nếu ngày của tin đã được chốt, mở lại ngày đó để lần chốt kế tiếp cập nhật.
         """
         row = self.conn.execute(
-            "SELECT id, day FROM messages WHERE chat_id = ? AND message_id = ?", (chat_id, message_id)
+            "SELECT id, day, text FROM messages WHERE chat_id = ? AND message_id = ?", (chat_id, message_id)
         ).fetchone()
+        if row is not None and row["text"] == text:
+            return  # chỉ đổi thứ khác nội dung (ví dụ reaction): không cần xử lý lại
         if row is None:
             self.add_message(chat_id, message_id, user_id, user_name, text, reply_to, sent_at)
             day = sent_at.date().isoformat()

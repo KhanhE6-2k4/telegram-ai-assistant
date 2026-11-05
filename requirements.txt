@@ -3,3 +3,4 @@ anthropic>=2.3
 openai>=3.41
 python-dotenv>=1.0
 gspread>=6.0
+telethon>=1.36

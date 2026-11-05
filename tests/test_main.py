@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
-from bot.main import cmd_tasks, on_startup, sent_while_offline, split_message
+from bot.main import do_tasks, on_startup, sent_while_offline, split_message
 from bot.sheets import HEADER
 from tests.test_sheets import FakeWorksheet
 from bot.storage import DaySummary, Storage
@@ -32,7 +32,7 @@ def test_startup_finalizes_past_days_and_processes_today_pending():
     async def review(chat_id):
         calls.append(("review", chat_id))
 
-    st = SimpleNamespace(storage=s, busy=set(), today=lambda: "2026-10-29", compact=compact, review=review)
+    st = SimpleNamespace(storage=s, busy=set(), today=lambda: "2026-10-29", compact=compact, review=review, userbot=None)
     context = SimpleNamespace(application=SimpleNamespace(bot_data={"state": st}))
     asyncio.run(on_startup(context))
     assert calls == [
@@ -80,8 +80,8 @@ def run_task_command(rows, args, pending_today=False):
         task_sheet=lambda chat_id: TaskSheet(ws, s, chat_id),
     )
     update = SimpleNamespace(effective_message=msg, effective_chat=SimpleNamespace(id=-1))
-    context = SimpleNamespace(args=args, application=SimpleNamespace(bot_data={"state": st}))
-    asyncio.run(cmd_tasks(update, context))
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"state": st}), bot=SimpleNamespace(username="ant_bot"))
+    asyncio.run(do_tasks(update, context, " ".join(args)))
     return "\n".join(msg.sent)
 
 
@@ -108,29 +108,31 @@ def test_task_command_filters_by_assignee_case_insensitive():
 
 
 def test_task_command_hints_unprocessed_messages():
-    assert "Gõ /tomtat để cập nhật" in run_task_command(TASK_ROWS, [], pending_today=True)
-    assert "/tomtat" not in run_task_command(TASK_ROWS, [])
+    assert "Gõ @ant_bot <summarize> để cập nhật" in run_task_command(TASK_ROWS, [], pending_today=True)
+    assert "<summarize>" not in run_task_command(TASK_ROWS, [])
 
 
-# ---- /ask và tin tag bot ----
 
-from telegram import ForceReply
 
-from bot.main import cmd_ask, command_argument, on_group_message, strip_mention, ASK_PROMPT, OFFLINE_REPLY
+# ---- tin tag bot trong nhóm ----
+
+from bot.main import (
+    command_argument, mention_help, on_group_message, remember_chat, route_mention, strip_mention, OFFLINE_REPLY,
+)
 
 
 def test_command_argument_keeps_text_after_command():
-    assert command_argument("/ask task Q3 hạn khi nào?") == "task Q3 hạn khi nào?"
-    assert command_argument("/ask@ant_bot  dòng 1\ndòng 2") == "dòng 1\ndòng 2"
-    assert command_argument("/ask") == ""
+    assert command_argument("/g @team hạn khi nào?") == "@team hạn khi nào?"
+    assert command_argument("/g@ant_bot  dòng 1\ndòng 2") == "dòng 1\ndòng 2"
+    assert command_argument("/g") == ""
 
 
 class FakeMsg(Replies):
     ids = iter(range(1, 10**6))
 
-    def __init__(self, text, date, mentions=(), user_id=1, reply_to=None):
+    def __init__(self, text, date, mentions=(), user_id=1, reply_to=None, chat_id=-1):
         super().__init__()
-        self.text, self.caption, self.date = text, None, date
+        self.text, self.caption, self.date, self.chat_id = text, None, date, chat_id
         self.message_id, self.from_user = next(FakeMsg.ids), SimpleNamespace(id=user_id, full_name="An")
         self.reply_to_message = SimpleNamespace(message_id=reply_to) if reply_to else None
         self._mentions = {i: m for i, m in enumerate(mentions)}
@@ -152,23 +154,31 @@ ONLINE = datetime(2026, 10, 29, 3, tzinfo=timezone.utc)
 OFFLINE = datetime(2026, 10, 29, 1, tzinfo=timezone.utc)
 
 
-def make_state():
+def make_state(userbot=None):
     return SimpleNamespace(
         storage=Storage(":memory:"), started_at=datetime(2026, 10, 29, 2, tzinfo=timezone.utc),
-        config=SimpleNamespace(timezone=ZoneInfo("Asia/Ho_Chi_Minh"), compact_threshold_chars=60000),
-        pending_asks={}, busy=set(), today=lambda: "2026-10-29",
+        config=SimpleNamespace(timezone=ZoneInfo("Asia/Ho_Chi_Minh"), compact_threshold_chars=60000,
+                               userbot_history_days=7),
+        busy=set(), today=lambda: "2026-10-29", userbot=userbot, pending_edits={}, pending_picks={}, session=None,
     )
 
 
 def deliver(st, handler, msg, edited=False):
-    """Gửi một tin tới handler, chạy các tác vụ nền; trả về các câu hỏi đã chuyển cho answer_question."""
-    asked = []
+    """Gửi một tin tới handler, chạy các tác vụ nền; trả về [(loại, tham số)] các yêu cầu đã chuyển đi."""
+    calls = []
 
     async def fake_answer(update, context, question):
-        asked.append(question)
+        calls.append(("ask", question))
+
+    async def fake_summary(update, context, day):
+        calls.append(("summary", day))
+
+    async def fake_tasks(update, context, who):
+        calls.append(("tasks", who))
 
     import bot.main as m
-    original, m.answer_question = m.answer_question, fake_answer
+    saved = m.answer_question, m.do_summary, m.do_tasks
+    m.answer_question, m.do_summary, m.do_tasks = fake_answer, fake_summary, fake_tasks
     try:
         app = RecordingApp(st)
         update = SimpleNamespace(effective_message=msg, effective_chat=SimpleNamespace(id=-1, title="A"),
@@ -178,68 +188,27 @@ def deliver(st, handler, msg, edited=False):
         for coro in app.tasks:
             asyncio.run(coro)
     finally:
-        m.answer_question = original
-    return asked
+        m.answer_question, m.do_summary, m.do_tasks = saved
+    return calls
 
 
 def stored(st):
     return st.storage.conn.execute("select count(*) from messages").fetchone()[0]
 
 
-def test_ask_passes_question():
-    st, msg = make_state(), FakeMsg("/ask task báo cáo Q3 hạn khi nào?", ONLINE)
-    assert deliver(st, cmd_ask, msg) == ["task báo cáo Q3 hạn khi nào?"]
-    assert msg.sent == []
-
-
-def test_ask_sent_while_offline_is_not_answered():
-    st, msg = make_state(), FakeMsg("/ask hạn khi nào?", OFFLINE)
-    assert deliver(st, cmd_ask, msg) == []
-    assert msg.sent == [OFFLINE_REPLY]
-
-
-def test_empty_ask_prompts_with_force_reply_then_reply_is_the_question():
-    """Bấm /ask từ menu (gửi ngay, không có câu hỏi) -> bot hỏi lại, mở ô trả lời; câu trả lời là câu hỏi."""
-    st, cmd = make_state(), FakeMsg("/ask@ant_bot", ONLINE, user_id=1)
-    assert deliver(st, cmd_ask, cmd) == []
-    assert cmd.sent == [ASK_PROMPT]
-    markup = cmd.markups[0]
-    assert isinstance(markup, ForceReply) and markup.selective and markup.input_field_placeholder
-    prompt_id = 101  # message_id của tin hỏi lại (xem Replies.reply_text)
-    assert st.pending_asks == {(-1, prompt_id): 1}
-
-    # Người khác reply tin hỏi lại: coi là tin thường của nhóm
-    other = FakeMsg("chuyện khác", ONLINE, user_id=2, reply_to=prompt_id)
-    assert deliver(st, on_group_message, other) == [] and stored(st) == 1
-
-    # Đúng người gõ /ask trả lời: thành câu hỏi, không lưu vào hội thoại
-    answer = FakeMsg("báo cáo Q3 hạn khi nào?", ONLINE, user_id=1, reply_to=prompt_id)
-    assert deliver(st, on_group_message, answer) == ["báo cáo Q3 hạn khi nào?"]
-    assert stored(st) == 1 and st.pending_asks == {}
-
-    # Chỉ có hiệu lực một lần: trả lời tiếp lần nữa là tin thường
-    again = FakeMsg("thêm câu nữa", ONLINE, user_id=1, reply_to=prompt_id)
-    assert deliver(st, on_group_message, again) == [] and stored(st) == 2
-
-
-def test_remember_chat_records_group_title_from_any_update():
-    """Lệnh đầu tiên trong nhóm (DB còn trống) cũng lưu tên nhóm, để tab mới không bị đặt theo chat id."""
-    from bot.main import remember_chat
-
-    st = make_state()
-    context = SimpleNamespace(application=SimpleNamespace(bot_data={"state": st}))
-
-    def send(chat):
-        asyncio.run(remember_chat(SimpleNamespace(effective_chat=chat), context))
-
-    send(SimpleNamespace(id=-1, type="supergroup", title="Team A"))
-    assert st.storage.chat_title(-1) == "Team A"
-    send(SimpleNamespace(id=-1, type="supergroup", title="Team A mới"))  # nhóm đổi tên
-    assert st.storage.chat_title(-1) == "Team A mới"
-    send(SimpleNamespace(id=5, type="private", title=None))  # chat riêng: không lưu
-    send(None)  # cập nhật không gắn với chat nào
-    assert st.storage.chat_title(5) is None
-    assert st.storage.conn.execute("select count(*) from chats").fetchone()[0] == 1
+def test_route_mention():
+    assert route_mention("<summarize>") == ("summary", "")
+    assert route_mention("<summarize> 2026-11-01") == ("summary", "2026-11-01")
+    assert route_mention("<SUMMARIZE>") == ("summary", "")
+    assert route_mention("<task>") == ("tasks", "")
+    assert route_mention("<task> Lan") == ("tasks", "Lan")
+    assert route_mention("<Task>  Lan Anh") == ("tasks", "Lan Anh")
+    # Từ khoá không có ngoặc nhọn là câu hỏi
+    assert route_mention("task Q3 hạn khi nào?") == ("ask", "task Q3 hạn khi nào?")
+    assert route_mention("dời hạn task Q3 sang 10/11") == ("ask", "dời hạn task Q3 sang 10/11")
+    assert route_mention("<abc>") == ("help", "")
+    assert route_mention("<summarize> hôm qua") == ("help", "")  # ngày sai cú pháp
+    assert route_mention("") == ("help", "")
 
 
 def test_strip_mention_keeps_question():
@@ -250,23 +219,32 @@ def test_strip_mention_keeps_question():
     assert strip_mention("  @ant_bot  ", "ant_bot") == ""
 
 
-def test_tag_bot_is_answered_like_ask_and_is_not_stored():
+def test_tag_bot_routes_by_keyword_and_is_not_stored():
     st = make_state()
-    msg = FakeMsg("@ant_bot dời hạn task Q3 sang 10/11", ONLINE, mentions=["@ant_bot"])
-    assert deliver(st, on_group_message, msg) == ["dời hạn task Q3 sang 10/11"]
-    assert msg.sent == []
+    cases = [
+        ("@ant_bot dời hạn task Q3 sang 10/11", ("ask", "dời hạn task Q3 sang 10/11")),
+        ("@ant_bot <summarize>", ("summary", "2026-10-29")),  # mặc định hôm nay
+        ("@ant_bot <summarize> 2026-10-20", ("summary", "2026-10-20")),
+        ("@ant_bot <task> Lan", ("tasks", "Lan")),
+        ("@ant_bot task Q3 hạn khi nào?", ("ask", "task Q3 hạn khi nào?")),
+    ]
+    for text, expected in cases:
+        msg = FakeMsg(text, ONLINE, mentions=["@ant_bot"])
+        assert deliver(st, on_group_message, msg) == [expected]
+        assert msg.sent == []
     # Không lưu: bước ghi task không thể làm theo yêu cầu sửa chưa được xác nhận
     assert stored(st) == 0
 
 
-def test_tag_bot_alone_prompts_for_question():
-    st, msg = make_state(), FakeMsg("@ant_bot", ONLINE, mentions=["@ant_bot"], user_id=1)
-    assert deliver(st, on_group_message, msg) == []
-    assert msg.sent == [ASK_PROMPT] and isinstance(msg.markups[0], ForceReply)
-    assert st.pending_asks == {(-1, 101): 1} and stored(st) == 0
-    # Người đó trả lời tin hỏi lại: thành câu hỏi
-    answer = FakeMsg("báo cáo Q3 hạn khi nào?", ONLINE, user_id=1, reply_to=101)
-    assert deliver(st, on_group_message, answer) == ["báo cáo Q3 hạn khi nào?"]
+def test_tag_bot_alone_or_unknown_keyword_replies_help():
+    st = make_state()
+    for text in ("@ant_bot", "@ant_bot <abc> gì đó"):
+        msg = FakeMsg(text, ONLINE, mentions=["@ant_bot"])
+        assert deliver(st, on_group_message, msg) == []
+        assert msg.sent == [mention_help("ant_bot")]
+    assert "@ant_bot <summarize>" in mention_help("ant_bot") and "@ant_bot <task>" in mention_help("ant_bot")
+    assert stored(st) == 0
+    assert not hasattr(st, "pending_asks")  # không còn trạng thái chờ câu hỏi
 
 
 def test_tag_bot_offline_or_edited_is_not_answered():
@@ -276,3 +254,33 @@ def test_tag_bot_offline_or_edited_is_not_answered():
     edited = FakeMsg("@ant_bot hạn khi nào?", ONLINE, mentions=["@ant_bot"])
     assert deliver(st, on_group_message, edited, edited=True) == [] and edited.sent == []
     assert stored(st) == 0
+
+
+def test_group_message_stored_by_bot_only_without_userbot():
+    # Chế độ dự phòng: không có userbot thì bot tự lưu tin nhóm như cũ
+    st = make_state()
+    deliver(st, on_group_message, FakeMsg("Lan làm báo cáo nhé", ONLINE))
+    assert stored(st) == 1
+    # Có userbot: userbot là nguồn tin, bot không lưu
+    st = make_state(userbot=SimpleNamespace(me=SimpleNamespace(id=7), tracked=set()))
+    deliver(st, on_group_message, FakeMsg("Lan làm báo cáo nhé", ONLINE))
+    assert stored(st) == 0
+
+
+def test_remember_chat_records_group_title_and_tracks_it():
+    """Cập nhật đầu tiên trong nhóm (DB còn trống) cũng lưu tên nhóm, để tab mới không bị đặt theo chat id."""
+    st = make_state()
+    context = SimpleNamespace(application=RecordingApp(st))
+
+    def send(chat):
+        asyncio.run(remember_chat(SimpleNamespace(effective_chat=chat, my_chat_member=None), context))
+
+    send(SimpleNamespace(id=-1, type="supergroup", title="Team A"))
+    assert st.storage.chat_title(-1) == "Team A"
+    assert st.storage.tracked_chats() == [-1]
+    send(SimpleNamespace(id=-1, type="supergroup", title="Team A mới"))  # nhóm đổi tên
+    assert st.storage.chat_title(-1) == "Team A mới"
+    send(SimpleNamespace(id=5, type="private", title=None))  # chat riêng: không lưu
+    send(None)  # cập nhật không gắn với chat nào
+    assert st.storage.chat_title(5) is None
+    assert st.storage.conn.execute("select count(*) from chats").fetchone()[0] == 1

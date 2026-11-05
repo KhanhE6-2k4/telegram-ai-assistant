@@ -1,4 +1,4 @@
-"""Trả lời lệnh /ask, bằng LLM (provider bất kỳ) với hai công cụ:
+"""Trả lời câu hỏi (tag @bot trong nhóm, lệnh riêng của chủ bot), bằng LLM (provider bất kỳ) với hai công cụ:
 
 - list_tasks: danh sách task (lấy từ Google Sheet, kèm ngày giao lưu trong SQLite)
 - get_day: bản tóm tắt + tin nhắn chưa nén của một ngày
@@ -8,10 +8,11 @@ Model tự quyết định gọi công cụ nào, nên câu hỏi không cần g
 import asyncio
 import json
 import logging
+from collections.abc import Sequence
 from datetime import date, timedelta
 
 from .dates import DEADLINE_RULES, WEEKDAYS, calendar_text
-from .providers import LLMProvider, Tool, ToolCall, run_tool_loop
+from .providers import ChatMessage, LLMProvider, Tool, ToolCall, run_tool_loop
 from .sheets import FIELDS, TaskSheet
 from .storage import Storage
 
@@ -19,8 +20,8 @@ log = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 6
 
-SYSTEM_PROMPT = """Bạn là bot trợ lý của nhóm chat Telegram "{title}". Hôm nay là {today} ({weekday}).
-Thành viên dùng lệnh /ask để hỏi bạn về task và nội dung trao đổi trong nhóm.
+SYSTEM_PROMPT = """Bạn là bot trợ lý của cuộc trò chuyện Telegram "{title}" (nhóm chat hoặc chat riêng).
+Hôm nay là {today} ({weekday}). Người dùng hỏi bạn về task và nội dung trao đổi trong cuộc trò chuyện này.
 
 - Dùng công cụ để tra cứu, không đoán. Thông tin task (nội dung, tiến độ, deadline) lấy từ
   list_tasks vì đó là dữ liệu trên Google Sheet, nguồn chính thức.
@@ -28,7 +29,7 @@ Thành viên dùng lệnh /ask để hỏi bạn về task và nội dung trao �
   lên sheet. Với câu hỏi về task, hãy gọi CẢ list_tasks VÀ get_day cho hôm nay (và ngày liên quan
   nếu câu hỏi nhắc tới), rồi kết hợp: phần recent_messages của get_day là thông tin mới nhất.
   Nếu thông tin chỉ có trong tin nhắn (chưa có trên sheet), vẫn trả lời và nói rõ là theo tin nhắn
-  trong nhóm, chưa ghi lên sheet.
+  trong cuộc trò chuyện, chưa ghi lên sheet.
 - Nếu câu hỏi không ghi rõ tên task hoặc ngày, hãy cố tìm task khớp nhất (theo từ khoá, người nhận,
   thời gian). Nếu có nhiều task khớp, liệt kê ngắn gọn để người hỏi chọn.
 - Ngày tương đối hãy quy đổi theo ngày hôm nay (ngày mốc), dùng bảng lịch bên dưới; "hôm qua" =
@@ -68,7 +69,7 @@ EDIT_TOOL = Tool(
 TOOLS = [
     Tool(
         name="list_tasks",
-        description="Liệt kê các task của nhóm (STT, ngày giao, tên, người thực hiện, nội dung, tiến độ, deadline). "
+        description="Liệt kê các task của cuộc trò chuyện (STT, ngày giao, tên, người thực hiện, nội dung, tiến độ, deadline). "
         "Có thể lọc theo khoảng ngày giao.",
         parameters={
             "type": "object",
@@ -147,9 +148,17 @@ class QA:
     # ---- vòng hỏi đáp ----
 
     async def answer(
-        self, chat_id: int, chat_title: str, today: str, asker: str, question: str, can_edit: bool = False
+        self,
+        chat_id: int,
+        chat_title: str,
+        today: str,
+        asker: str,
+        question: str,
+        can_edit: bool = False,
+        history: Sequence[tuple[str, str]] = (),
     ) -> tuple[str, list[dict]]:
-        """Trả về (câu trả lời, danh sách đề xuất sửa task đang chờ xác nhận)."""
+        """Trả về (câu trả lời, danh sách đề xuất sửa task đang chờ xác nhận).
+        `history`: các lượt (câu hỏi, câu trả lời) trước của cùng chủ đề, để model hiểu câu hỏi tiếp theo."""
         proposals: list[dict] = []
         tools = TOOLS + [EDIT_TOOL] if can_edit else TOOLS
         system = SYSTEM_PROMPT.format(
@@ -173,6 +182,9 @@ class QA:
             self.llm,
             system=system,
             prompt=f"{asker} hỏi: {question}",
+            history=[
+                m for q, a in history for m in (ChatMessage.user(f"{asker} hỏi: {q}"), ChatMessage("assistant", text=a))
+            ],
             tools=tools,
             execute=execute,
             max_rounds=MAX_TOOL_ROUNDS,

@@ -58,9 +58,15 @@ def _default_build(config: Config):
 
 
 async def _default_post_init(app) -> None:
-    from .main import set_bot_commands
+    from .main import post_init
 
-    await set_bot_commands(app)
+    await post_init(app)
+
+
+async def _stop_userbot(app) -> None:
+    from .main import stop_userbot
+
+    await stop_userbot(app)
 
 
 class BotRunner:
@@ -184,6 +190,7 @@ class BotRunner:
         for step in (
             lambda: app.updater.stop() if app.updater and app.updater.running else None,
             lambda: app.stop() if app.running else None,
+            lambda: _stop_userbot(app) if "state" in app.bot_data else None,
             app.shutdown,
             # Đóng DB để thư mục dữ liệu xoá được (Windows không cho xoá tệp đang mở)
             lambda: app.bot_data["state"].storage.close() if "state" in app.bot_data else None,

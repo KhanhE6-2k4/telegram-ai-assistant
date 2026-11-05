@@ -1,8 +1,9 @@
 """Cấu hình của app desktop (không phụ thuộc Toga, để test trực tiếp).
 
 - Thiết lập thường (provider, model, spreadsheet_id): `<thư mục cấu hình>/settings.json`.
-- Khoá bí mật (Telegram token, API key của từng provider): Windows Credential Manager qua `keyring`.
-  Mỗi provider một key riêng, nên đổi qua lại provider không mất key.
+- Khoá bí mật (Telegram token, API key của từng provider, Telegram API ID / Hash và session của userbot):
+  Windows Credential Manager qua `keyring`. Mỗi provider một key riêng, nên đổi qua lại provider không mất
+  key. Session userbot cho toàn quyền vào tài khoản Telegram: chỉ lưu ở đây, không ghi log.
 - Tệp khoá Google được chép vào `<thư mục cấu hình>/credentials.json`.
 - Các thiết lập khác (múi giờ, giờ chốt...) dùng giá trị mặc định như bản dòng lệnh.
 """
@@ -17,6 +18,11 @@ from bot.config import Config, config_from
 # Tên dịch vụ trong Credential Manager
 KEYRING_SERVICE = "Telegram Bot"
 TOKEN_SECRET = "telegram_bot_token"
+# Userbot (tài khoản Telegram của chủ bot): tuỳ chọn, để trống thì bot chạy chế độ dự phòng
+API_ID_SECRET = "telegram_api_id"
+API_HASH_SECRET = "telegram_api_hash"
+SESSION_SECRET = "userbot_session"
+USERBOT_SECRETS = (API_ID_SECRET, API_HASH_SECRET, SESSION_SECRET)
 
 
 @dataclass(frozen=True)
@@ -45,6 +51,11 @@ def parse_spreadsheet_id(text: str) -> str:
     text = text.strip()
     m = re.search(r"/spreadsheets/d/([A-Za-z0-9_-]+)", text)
     return m.group(1) if m else text
+
+
+def valid_api_id(text: str) -> bool:
+    """Telegram API ID là một số (lấy ở my.telegram.org)."""
+    return text.strip().isdigit()
 
 
 def read_service_account(path: Path) -> str:
@@ -137,10 +148,19 @@ class SettingsStore:
     def api_key(self, provider: str) -> str:
         return self.get_secret(api_key_secret(provider))
 
+    def telegram_api(self) -> tuple[str, str]:
+        """(API ID, API Hash) của userbot; chưa nhập thì chuỗi rỗng."""
+        return self.get_secret(API_ID_SECRET), self.get_secret(API_HASH_SECRET)
+
+    def userbot_session(self) -> str:
+        return self.get_secret(SESSION_SECRET)
+
     def delete_all_secrets(self) -> None:
         self.delete_secret(TOKEN_SECRET)
         for provider in PROVIDERS:
             self.delete_secret(api_key_secret(provider))
+        for name in USERBOT_SECRETS:
+            self.delete_secret(name)
 
     # Tệp khoá Google
 
@@ -162,15 +182,30 @@ class SettingsStore:
     # Tạo Config cho bot
 
     def to_config(
-        self, settings: Settings, telegram_token: str | None = None, api_key: str | None = None
+        self,
+        settings: Settings,
+        telegram_token: str | None = None,
+        api_key: str | None = None,
+        telegram_api: tuple[str, str] | None = None,
+        userbot_session: str | None = None,
     ) -> Config:
-        """Config cho bot. Token / key không truyền vào thì lấy từ Credential Manager."""
+        """Config cho bot. Token / key / API ID, Hash / session không truyền vào thì lấy từ Credential Manager.
+        API ID / Hash trống thì không có userbot (chế độ dự phòng)."""
+        api_id, api_hash = telegram_api if telegram_api is not None else self.telegram_api()
+        api_id, api_hash = api_id.strip(), api_hash.strip()
+        if not (valid_api_id(api_id) and api_hash):
+            api_id = api_hash = userbot_session = ""
+        elif userbot_session is None:
+            userbot_session = self.userbot_session()
         return config_from(
             {
                 "TELEGRAM_BOT_TOKEN": telegram_token if telegram_token is not None else self.telegram_token(),
                 "SPREADSHEET_ID": parse_spreadsheet_id(settings.spreadsheet_id),
                 "GOOGLE_CREDENTIALS_FILE": str(self.credentials_file),
                 "DB_PATH": str(self.db_path),
+                "TELEGRAM_API_ID": api_id,
+                "TELEGRAM_API_HASH": api_hash,
+                "USERBOT_SESSION": userbot_session,
             },
             provider=settings.provider,
             model=settings.model or None,

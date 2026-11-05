@@ -1,7 +1,7 @@
 """Cấu hình đọc từ biến môi trường (hoặc file .env)."""
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
 
 
@@ -29,7 +29,18 @@ class Config:
     editor_user_ids: frozenset[int]
     # API key của provider; để trống thì provider đọc biến môi trường riêng của nó.
     # App desktop truyền key lấy từ Windows Credential Manager vào đây.
-    llm_api_key: str | None = None
+    llm_api_key: str | None = field(default=None, repr=False)
+    # Userbot (tài khoản Telegram của chủ bot, nguồn tin nhắn). Thiếu một trong ba thì chạy chế độ dự
+    # phòng: bot tự lưu tin nhóm như trước. Session cho toàn quyền vào tài khoản: không ghi log.
+    telegram_api_id: int | None = None
+    telegram_api_hash: str | None = field(default=None, repr=False)
+    userbot_session: str | None = field(default=None, repr=False)
+    # Lần đầu bổ sung tin của một chat thì lấy bấy nhiêu ngày gần nhất
+    userbot_history_days: int = 7
+
+    @property
+    def userbot_configured(self) -> bool:
+        return bool(self.telegram_api_id and self.telegram_api_hash and self.userbot_session)
 
 
 def load_env_file() -> None:
@@ -68,6 +79,7 @@ DEFAULTS = {
     "COMPACT_RETRY_DELAY_SECONDS": "60",
     "GOOGLE_CREDENTIALS_FILE": "credentials.json",
     "EDITOR_USER_IDS": "",
+    "USERBOT_HISTORY_DAYS": "7",
 }
 
 
@@ -102,6 +114,10 @@ def config_from(
         spreadsheet_id=get("SPREADSHEET_ID"),
         editor_user_ids=frozenset(int(x) for x in get("EDITOR_USER_IDS").replace(" ", "").split(",") if x),
         llm_api_key=api_key or None,
+        telegram_api_id=int(get("TELEGRAM_API_ID")) if get("TELEGRAM_API_ID") else None,
+        telegram_api_hash=get("TELEGRAM_API_HASH") or None,
+        userbot_session=get("USERBOT_SESSION") or None,
+        userbot_history_days=max(0, int(get("USERBOT_HISTORY_DAYS"))),
     )
 
 

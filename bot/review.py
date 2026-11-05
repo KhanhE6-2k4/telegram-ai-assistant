@@ -133,7 +133,7 @@ async def review_sheet(storage: Storage, sheet: TaskSheet, llm: LLMProvider, cha
     kể từ lần rà trước (bỏ qua). Lỗi (LLM / Google Sheet) được ném ra; lần khởi động sau rà lại."""
     assigned = await asyncio.to_thread(sheet.assign_missing_stt, today)
     if assigned:
-        log.info("Chat %s: gán STT cho dòng nhập tay: %s", chat_id, assigned)
+        log.info("Chat %s: gán STT cho dòng nhập tay: %s", storage.chat_label(chat_id), assigned)
 
     tasks = sheet.rows()
     if storage.review_fingerprint(chat_id) == fingerprint(tasks):
@@ -156,5 +156,5 @@ async def review_sheet(storage: Storage, sheet: TaskSheet, llm: LLMProvider, cha
         if answer is None:
             raise RuntimeError("Model gọi công cụ quá nhiều vòng khi rà soát sheet")
     storage.save_review(chat_id, fingerprint(sheet.rows()))
-    log.info("Đã rà soát sheet của chat %s", chat_id)
+    log.info("Đã rà soát sheet của chat %s", storage.chat_label(chat_id))
     return True

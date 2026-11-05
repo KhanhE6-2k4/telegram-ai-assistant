@@ -172,9 +172,12 @@ class SheetClient:
         spreadsheet: Any,
         title_of: Callable[[int], str | None] = lambda chat_id: None,
         cache_seconds: float = 300,
+        label_of: Callable[[int], str] = str,
     ):
         self.sheet = spreadsheet
         self.title_of = title_of
+        # Nhãn chat cho log (tên + username + chat id), xem Storage.chat_label
+        self.label_of = label_of
         self.cache_seconds = cache_seconds
         self._cache: dict[int, tuple[float, Any]] = {}
         # Các tab (sheetId) đã kiểm tra cấu trúc cột trong lần chạy này
@@ -183,10 +186,19 @@ class SheetClient:
         self._lock = threading.Lock()
 
     @classmethod
-    def open(cls, credentials_file: str, spreadsheet_id: str, title_of: Callable[[int], str | None]) -> "SheetClient":
+    def open(
+        cls,
+        credentials_file: str,
+        spreadsheet_id: str,
+        title_of: Callable[[int], str | None],
+        label_of: Callable[[int], str] = str,
+    ) -> "SheetClient":
         import gspread
 
-        return cls(gspread.service_account(filename=credentials_file).open_by_key(spreadsheet_id), title_of)
+        return cls(
+            gspread.service_account(filename=credentials_file).open_by_key(spreadsheet_id), title_of,
+            label_of=label_of,
+        )
 
     def forget(self, chat_id: int) -> None:
         """Bỏ tab đã nhớ của nhóm (ví dụ sau khi ghi sheet lỗi), lần sau tra lại từ đầu."""
@@ -252,7 +264,7 @@ class SheetClient:
             if title != legacy["properties"]["title"]:
                 requests.insert(0, self._rename(sheet_id, title))
             self.sheet.batch_update({"requests": requests})
-            log.info("Nhận lại tab cũ của chat %s, đổi tên thành %r", chat_id, title)
+            log.info("Nhận lại tab cũ của chat %s, đổi tên thành %r", self.label_of(chat_id), title)
             return self.sheet.get_worksheet_by_id(sheet_id)
 
         title = self._wanted_title(chat_id, tabs, None)
@@ -263,7 +275,7 @@ class SheetClient:
             self._tag(ws.id, CHAT_ID_KEY, str(chat_id)),
             self._tag(ws.id, TAB_TITLE_KEY, title),
         ]})
-        log.info("Tạo tab %r cho chat %s", title, chat_id)
+        log.info("Tạo tab %r cho chat %s", title, self.label_of(chat_id))
         return ws
 
     def _sync_title(self, chat_id: int, tab: dict, md: dict[str, dict], tabs: list[dict]) -> None:
@@ -285,7 +297,7 @@ class SheetClient:
             else self._tag(sheet_id, TAB_TITLE_KEY, wanted)
         )
         self.sheet.batch_update({"requests": [self._rename(sheet_id, wanted), update_title]})
-        log.info("Đổi tên tab của chat %s: %r -> %r", chat_id, current, wanted)
+        log.info("Đổi tên tab của chat %s: %r -> %r", self.label_of(chat_id), current, wanted)
 
     @staticmethod
     def _rename(sheet_id: int, title: str) -> dict:

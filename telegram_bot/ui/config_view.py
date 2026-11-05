@@ -1,4 +1,5 @@
-"""Tab Cấu hình: provider, model, API key, Telegram token, Google Sheet, tệp khoá, Kiểm tra kết nối.
+"""Tab Cấu hình: provider, model, API key, Telegram (bot token, API ID / Hash của userbot), Google Sheet,
+tệp khoá, Kiểm tra kết nối.
 
 Không có nút Lưu: bấm Kiểm tra kết nối, cả 3 mục đều ✓ thì app tự lưu và (khởi động lại) bot.
 """
@@ -42,7 +43,20 @@ class ConfigView:
         telegram = Card(theme, "Telegram")
         self.token = toga.PasswordInput(placeholder="Lấy từ @BotFather")
         token_row = FormRow(theme, "Bot token", self.token)
-        telegram.add(token_row.box)
+        # Userbot (tài khoản Telegram của chủ bot): tuỳ chọn. Session lấy qua cửa sổ đăng nhập khi kiểm tra
+        # kết nối / bật bot, không nhập tay
+        self.api_id = toga.TextInput(placeholder="Ví dụ 1234567")
+        self.api_hash = toga.PasswordInput()
+        api_id_row = FormRow(theme, "Telegram API ID", self.api_id)
+        api_hash_row = FormRow(theme, "Telegram API Hash", self.api_hash)
+        self.api_hint = WrappedLabel(
+            "Tài khoản Telegram của bạn (userbot) dùng để đọc tin nhắn của nhóm và chat riêng. Lấy API ID / "
+            "API Hash ở my.telegram.org → API development tools. Để trống nếu không dùng.",
+            # Khi kiểm tra kết "
+            # "nối hoặc bật bot, nếu chưa đăng nhập (hoặc phiên đã hết hạn) app sẽ mở cửa sổ đăng nhập Telegram.",
+            style=Pack(font_size=t.SMALL, color=theme.muted),
+        )
+        telegram.add(token_row.box, api_id_row.box, api_hash_row.box, self.api_hint.widget)
 
         # Google Sheet
         sheet = Card(theme, "Google Sheet")
@@ -59,7 +73,8 @@ class ConfigView:
         self.check = button(theme, "Kiểm tra kết nối", on_check)
         check_bar = ButtonBar(self.check)
         self.check_hint = WrappedLabel(
-            "Kiểm tra LLM, Telegram và Google Sheet. Cả 3 đều ✓ thì có nghĩa là đã cấu hình thành công.",
+            "Kiểm tra LLM, Telegram (bot, và tài khoản nếu đã nhập API ID / Hash) và Google Sheet. "
+            "Cả 3 đều ✓ thì có nghĩa là đã cấu hình thành công.",
             style=Pack(font_size=t.SMALL, color=theme.muted),
         )
         self.results_box = toga.Box(style=Pack(direction=COLUMN, gap=t.XS))
@@ -68,11 +83,18 @@ class ConfigView:
 
         self.page.add(llm, telegram, sheet, check)
         self.page.rows += [pick_bar, check_bar]
-        self.page.labels += [self.credentials, self.share_hint, self.check_hint]
+        self.page.labels += [self.api_hint, self.credentials, self.share_hint, self.check_hint]
 
     # Nạp / đọc giá trị
 
-    def load(self, settings: Settings, token: str, keys: dict[str, str], credentials_email: str | None) -> None:
+    def load(
+        self,
+        settings: Settings,
+        token: str,
+        keys: dict[str, str],
+        credentials_email: str | None,
+        telegram_api: tuple[str, str] = ("", ""),
+    ) -> None:
         self._loading = True
         try:
             self._keys = dict(keys)
@@ -80,6 +102,8 @@ class ConfigView:
             self.provider.value = PROVIDERS[settings.provider].label
             self._fill_provider(settings.provider, settings.model)
             set_input(self.token, value=token)
+            set_input(self.api_id, value=telegram_api[0])
+            set_input(self.api_hash, value=telegram_api[1])
             set_input(self.spreadsheet, value=settings.spreadsheet_id)
         finally:
             self._loading = False
@@ -93,6 +117,10 @@ class ConfigView:
             provider=self._provider, model=(self.model.value or "").strip(), spreadsheet_id=(self.spreadsheet.value or "").strip()
         )
         return settings, (self.token.value or "").strip(), keys
+
+    def telegram_api(self) -> tuple[str, str]:
+        """(Telegram API ID, API Hash) của userbot đang nhập trên form."""
+        return (self.api_id.value or "").strip(), (self.api_hash.value or "").strip()
 
     def set_credentials_email(self, email: str | None) -> None:
         if email:

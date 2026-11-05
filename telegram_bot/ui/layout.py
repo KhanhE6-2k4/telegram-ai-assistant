@@ -47,6 +47,18 @@ def set_style(widget: toga.Widget, **props) -> None:
         style.update(**changed)
 
 
+def remeasure(root: toga.Widget) -> None:
+    """Đo lại mọi widget trong `root` rồi bố trí lại một lần (xem Page.refresh)."""
+
+    def walk(widget: toga.Widget) -> None:
+        for child in widget.children:
+            walk(child)
+        widget._impl.refresh()
+
+    walk(root)
+    root.refresh()
+
+
 class WrappedLabel:
     """Label tự xuống dòng theo bề rộng (Label của Toga không tự xuống dòng)."""
 
@@ -163,14 +175,7 @@ class Page:
         (giật). Toga không có API công khai chỉ để đo lại, nên ở đây dùng `_impl.refresh()` cho từng
         widget rồi bố trí lại một lần.
         """
-
-        def remeasure(widget: toga.Widget) -> None:
-            for child in widget.children:
-                remeasure(child)
-            widget._impl.refresh()
-
         remeasure(self.content)
-        self.content.refresh()
 
     def set_width(self, available: int) -> None:
         """`available`: bề rộng vùng nội dung (cửa sổ trừ thanh bên trái)."""

@@ -116,6 +116,36 @@ def test_run_tool_loop_feeds_results_back():
     assert [m.role for m in llm.seen[1]] == ["user", "assistant", "tool"]
 
 
+def test_run_tool_loop_sends_history_before_prompt():
+    class Once(LLMProvider):
+        async def complete(self, *, system, messages, tools=(), tool_choice=None, max_tokens=4000):
+            self.seen = list(messages)
+            return Response("ok")
+
+    llm = Once("m")
+    history = [ChatMessage.user("câu trước"), ChatMessage("assistant", text="trả lời trước")]
+
+    async def execute(call):
+        return ""
+
+    assert asyncio.run(run_tool_loop(llm, system="s", prompt="câu mới", tools=[ECHO], execute=execute,
+                                     max_rounds=2, history=history)) == "ok"
+    assert [(m.role, m.text) for m in llm.seen] == [
+        ("user", "câu trước"), ("assistant", "trả lời trước"), ("user", "câu mới"),
+    ]
+
+
+def test_text_only_assistant_message_converts_for_every_provider():
+    """Ngữ cảnh chủ đề gửi các lượt trước dạng chữ (không có lượt gọi công cụ, không có provider_data)."""
+    from bot.providers.anthropic_provider import AnthropicProvider
+    from bot.providers.openai_provider import OpenAIChatProvider, OpenAIProvider
+
+    msg = ChatMessage("assistant", text="trả lời trước")
+    assert AnthropicProvider._convert(msg) == {"role": "assistant", "content": [{"type": "text", "text": "trả lời trước"}]}
+    assert OpenAIProvider._convert(msg) == [{"role": "assistant", "content": "trả lời trước"}]
+    assert OpenAIChatProvider._convert(msg) == [{"role": "assistant", "content": "trả lời trước"}]
+
+
 def test_run_tool_loop_gives_up_after_max_rounds():
     class Forever(LLMProvider):
         async def complete(self, **kw):

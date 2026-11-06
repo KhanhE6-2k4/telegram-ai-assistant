@@ -4,9 +4,9 @@ Bảng chats: tên chat gần nhất (đặt tên tab) và cờ tracked (userbot
 
 Mỗi chat (nhóm hoặc chat riêng, chat_id) có:
 - bảng messages: toàn bộ tin nhắn gốc, gắn nhãn ngày (day = YYYY-MM-DD theo múi giờ cấu hình).
-  edit_pending = 1 nghĩa là tin đã được nén rồi nhưng sau đó bị sửa, cần đưa lại vào lần xử lý tới.
+  edit_pending = 1 nghĩa là tin đã được xử lý rồi nhưng sau đó bị sửa, cần đưa lại vào lần xử lý tới.
 - bảng day_summaries: một dòng cho mỗi (chat_id, day), gồm bản tóm tắt và mốc compacted_until
-  (id tin nhắn cuối cùng đã được nén vào tóm tắt)
+  (id tin nhắn cuối cùng đã được xử lý, tức đã ghi task và gộp vào tóm tắt)
 - bảng task_meta: ngày giao / ngày cập nhật gần nhất của từng task (theo STT trên Google Sheet).
   Bản thân nội dung task nằm trên Google Sheet.
 """
@@ -21,7 +21,11 @@ CREATE TABLE IF NOT EXISTS chats (
     title       TEXT,
     updated_at  TEXT NOT NULL,
     tracked     INTEGER NOT NULL DEFAULT 0,
-    username    TEXT
+    username    TEXT,
+    -- Ngày (YYYY-MM-DD, theo TIMEZONE) bắt đầu theo dõi chat lần đầu
+    tracked_since  TEXT,
+    -- Bot có đủ tin nhắn của chat từ ngày này (lần đồng bộ đầu lấy USERBOT_HISTORY_DAYS ngày trước khi theo dõi)
+    data_from      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS messages (
@@ -65,6 +69,11 @@ CREATE TABLE IF NOT EXISTS sheet_reviews (
     reviewed_at  TEXT NOT NULL
 );
 """
+
+
+# Người gửi của ghi chú do bot lưu vào lịch sử chat (Storage.add_note): pha A không coi là giao việc mới,
+# bản tóm tắt ghi lại như một thay đổi đã thực hiện
+BOT_NOTE_NAME = "Bot (ghi chú)"
 
 
 def format_chat(chat_id: int, title: str | None, username: str | None) -> str:
@@ -142,6 +151,10 @@ class Storage:
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(chats)")}
         if "username" not in cols:
             self.conn.execute("ALTER TABLE chats ADD COLUMN username TEXT")
+        # Phạm vi dữ liệu: chat theo dõi từ trước khi có hai cột này thì để trống (xem data_coverage)
+        for col in ("tracked_since", "data_from"):
+            if col not in cols:
+                self.conn.execute(f"ALTER TABLE chats ADD COLUMN {col} TEXT")
         self.conn.commit()
 
     def upsert_chat(self, chat_id: int, title: str | None, username: str | None = None) -> None:
@@ -154,17 +167,40 @@ class Storage:
         )
         self.conn.commit()
 
-    def track_chat(self, chat_id: int, title: str | None, username: str | None = None) -> bool:
-        """Lưu tên chat (bỏ trống thì giữ tên / username cũ) và đánh dấu theo dõi. True nếu trước đó chưa theo dõi."""
+    def track_chat(
+        self, chat_id: int, title: str | None, username: str | None = None, today: str | None = None
+    ) -> bool:
+        """Lưu tên chat (bỏ trống thì giữ tên / username cũ) và đánh dấu theo dõi. True nếu trước đó chưa theo dõi.
+        `today` (YYYY-MM-DD theo TIMEZONE): ghi làm ngày bắt đầu theo dõi nếu chat chưa có ngày đó."""
         row = self.conn.execute("SELECT tracked FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
         self.conn.execute(
-            "INSERT INTO chats (chat_id, title, updated_at, tracked, username) VALUES (?, ?, ?, 1, ?) "
+            "INSERT INTO chats (chat_id, title, updated_at, tracked, username, tracked_since) "
+            "VALUES (?, ?, ?, 1, ?, ?) "
             "ON CONFLICT (chat_id) DO UPDATE SET title = COALESCE(excluded.title, chats.title), "
-            "updated_at = excluded.updated_at, tracked = 1, username = COALESCE(excluded.username, chats.username)",
-            (chat_id, title, datetime.now(timezone.utc).isoformat(), username),
+            "updated_at = excluded.updated_at, tracked = 1, username = COALESCE(excluded.username, chats.username), "
+            "tracked_since = COALESCE(chats.tracked_since, excluded.tracked_since)",
+            (chat_id, title, datetime.now(timezone.utc).isoformat(), username, today),
         )
         self.conn.commit()
         return row is None or not row["tracked"]
+
+    def set_data_from(self, chat_id: int, day: str) -> None:
+        """Ghi ngày bot bắt đầu có đủ tin nhắn của chat (lần đồng bộ đầu tiên). Đã có thì giữ nguyên."""
+        self.conn.execute(
+            "UPDATE chats SET data_from = COALESCE(data_from, ?) WHERE chat_id = ?", (day, chat_id)
+        )
+        self.conn.commit()
+
+    def data_coverage(self, chat_id: int) -> tuple[str | None, str | None]:
+        """(ngày bắt đầu theo dõi, ngày có đủ tin nhắn từ). Ngày có đủ tin nhắn = sớm hơn trong hai mốc: ngày lần
+        đồng bộ đầu bắt đầu lấy, và ngày có tin đầu tiên đã lưu (chat theo dõi từ trước khi có cột data_from, hoặc
+        tin do bot tự lưu ở chế độ dự phòng). None nếu không biết."""
+        row = self.conn.execute(
+            "SELECT tracked_since, data_from FROM chats WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        first = self.message_day_range(chat_id)
+        candidates = [d for d in ((row["data_from"] if row else None), first[0] if first else None) if d]
+        return (row["tracked_since"] if row else None), (min(candidates) if candidates else None)
 
     def untrack_chat(self, chat_id: int) -> None:
         self.conn.execute("UPDATE chats SET tracked = 0 WHERE chat_id = ?", (chat_id,))
@@ -185,7 +221,7 @@ class Storage:
         return datetime.fromisoformat(row["t"]) if row["t"] else None
 
     def pending_days(self, chat_id: int) -> list[str]:
-        """Các ngày của chat còn tin chưa xử lý (chưa nén hoặc bị sửa sau khi nén), cũ trước."""
+        """Các ngày của chat còn tin chưa xử lý (chưa xử lý lần nào, hoặc bị sửa sau khi xử lý), cũ trước."""
         rows = self.conn.execute(
             "SELECT DISTINCT m.day FROM messages m "
             "LEFT JOIN day_summaries s ON s.chat_id = m.chat_id AND s.day = m.day "
@@ -214,6 +250,16 @@ class Storage:
 
     # ---- tin nhắn ----
 
+    def add_note(self, chat_id: int, text: str, sent_at: datetime) -> None:
+        """Lưu ghi chú của bot (ví dụ đã sửa task theo xác nhận của người dùng) như một tin của ngày đó, người gửi
+        BOT_NOTE_NAME, để thay đổi đi vào bản tóm tắt ngày. message_id âm (đếm lùi từ -1) để không trùng id tin
+        Telegram (luôn dương). sent_at đã đổi sang múi giờ cấu hình."""
+        row = self.conn.execute(
+            "SELECT MIN(message_id) AS low FROM messages WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        next_id = min(0, row["low"] or 0) - 1
+        self.add_message(chat_id, next_id, None, BOT_NOTE_NAME, text, None, sent_at)
+
     def add_message(
         self,
         chat_id: int,
@@ -223,11 +269,13 @@ class Storage:
         text: str,
         reply_to: int | None,
         sent_at: datetime,
-    ) -> None:
+    ) -> bool:
         """sent_at phải là datetime đã đổi sang múi giờ cấu hình, để day đúng theo giờ địa phương.
+        Trả về True nếu tin được thêm, False nếu đã có (UNIQUE (chat_id, message_id), ví dụ đồng bộ tin nhắn
+        lấy lại tin cuối đã lưu).
 
-        Tin của một ngày đã chốt (ví dụ Telegram gửi bù tin lúc bot tắt, sau khi ngày đó đã được chốt)
-        sẽ mở lại ngày đó, để lần chốt kế tiếp xử lý tin này.
+        Tin của một ngày đã chốt (ví dụ tin gửi lúc bot tắt, được đồng bộ sau khi ngày đó đã chốt)
+        sẽ mở lại ngày đó, để lần chốt ngày kế tiếp xử lý tin này.
         """
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO messages "
@@ -250,6 +298,7 @@ class Storage:
                 (chat_id, sent_at.date().isoformat()),
             )
         self.conn.commit()
+        return bool(cur.rowcount)
 
     def edit_message(
         self,
@@ -263,7 +312,7 @@ class Storage:
     ) -> None:
         """Cập nhật nội dung tin nhắn bị sửa.
 
-        Nếu tin đã được nén vào tóm tắt, đánh dấu edit_pending để lần xử lý tới đưa lại vào.
+        Nếu tin đã được xử lý, đánh dấu edit_pending để lần xử lý tới đưa lại vào.
         Nếu ngày của tin đã được chốt, mở lại ngày đó để lần chốt kế tiếp cập nhật.
         """
         row = self.conn.execute(
@@ -288,7 +337,7 @@ class Storage:
         self.conn.commit()
 
     def pending_messages(self, chat_id: int, day: str, after_id: int) -> list[Message]:
-        """Tin nhắn chưa nén (id > after_id) cộng với các tin đã nén nhưng bị sửa sau đó."""
+        """Tin nhắn chưa xử lý (id > after_id) cộng với các tin đã xử lý nhưng bị sửa sau đó."""
         rows = self.conn.execute(
             "SELECT * FROM messages WHERE chat_id = ? AND day = ? AND (id > ? OR edit_pending = 1) ORDER BY id",
             (chat_id, day, after_id),
@@ -298,6 +347,30 @@ class Storage:
     def clear_edit_pending(self, ids: list[int]) -> None:
         self.conn.executemany("UPDATE messages SET edit_pending = 0 WHERE id = ?", [(i,) for i in ids])
         self.conn.commit()
+
+    def message_day_range(self, chat_id: int) -> tuple[str, str] | None:
+        """(ngày có tin đầu tiên, ngày có tin cuối cùng) đã lưu của chat; None nếu chưa có tin nào.
+        Dữ liệu chỉ có từ lúc bắt đầu theo dõi chat (lần đầu đồng bộ USERBOT_HISTORY_DAYS ngày)."""
+        row = self.conn.execute(
+            "SELECT MIN(day) AS first, MAX(day) AS last FROM messages WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+        return (row["first"], row["last"]) if row["first"] else None
+
+    def days_overview(self, chat_id: int, from_day: str, to_day: str) -> list[dict]:
+        """Các ngày CÓ tin nhắn trong khoảng [from_day, to_day], cũ trước: bản tóm tắt của ngày, tổng số tin
+        và số tin chưa xử lý (chưa có trong bản tóm tắt: chưa xử lý lần nào, hoặc bị sửa sau khi xử lý)."""
+        rows = self.conn.execute(
+            "SELECT m.day, COUNT(*) AS total, "
+            "SUM(CASE WHEN m.id > COALESCE(s.compacted_until, 0) OR m.edit_pending = 1 THEN 1 ELSE 0 END) AS pending, "
+            "COALESCE(s.summary, '') AS summary "
+            "FROM messages m LEFT JOIN day_summaries s ON s.chat_id = m.chat_id AND s.day = m.day "
+            "WHERE m.chat_id = ? AND m.day BETWEEN ? AND ? GROUP BY m.day ORDER BY m.day",
+            (chat_id, from_day, to_day),
+        ).fetchall()
+        return [
+            {"day": r["day"], "summary": r["summary"], "messages": r["total"], "unprocessed": r["pending"]}
+            for r in rows
+        ]
 
     def chats_with_messages_on(self, day: str) -> list[int]:
         rows = self.conn.execute(

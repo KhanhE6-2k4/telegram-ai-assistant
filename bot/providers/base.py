@@ -4,10 +4,16 @@ Phần còn lại của bot (summarizer, qa) chỉ làm việc với các kiểu
 Tool, ToolCall, ToolResult, ChatMessage, Response và LLMProvider.complete(). Mỗi provider
 (Anthropic, OpenAI, ...) tự chuyển đổi sang/khỏi định dạng API riêng của mình.
 """
+import logging
+import time
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal
+
+from ..timing import log_elapsed, timed
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -108,15 +114,33 @@ async def run_tool_loop(
     max_rounds: int,
     max_tokens: int = 4000,
     history: Sequence[ChatMessage] = (),
+    purpose: str = "LLM",
 ) -> str | None:
     """Vòng gọi công cụ: hỏi model, chạy các công cụ nó yêu cầu, gửi kết quả lại, đến khi model
     trả lời không kèm công cụ. Trả về câu trả lời cuối, hoặc None nếu vượt quá max_rounds.
-    `history`: các lượt hội thoại trước (ngữ cảnh), gửi trước `prompt`."""
+    `history`: các lượt hội thoại trước (ngữ cảnh), gửi trước `prompt`.
+    `purpose`: tên việc trong log thời gian (vd. "hỏi đáp", "ghi task"). Mỗi lượt gọi LLM và mỗi công cụ
+    được ghi thời gian, kèm độ dài dữ liệu gửi đi (prompt càng dài, model càng chậm)."""
     messages = [*history, ChatMessage.user(prompt)]
-    for _ in range(max_rounds):
+    for round_no in range(1, max_rounds + 1):
+        start = time.perf_counter()
         response = await llm.complete(system=system, messages=messages, tools=tools, max_tokens=max_tokens)
+        log_elapsed(
+            log, start, "gọi LLM (%s) lượt %d, gửi %d ký tự, kết quả: %s",
+            purpose, round_no, prompt_chars(system, messages),
+            f"{len(response.tool_calls)} lệnh gọi công cụ" if response.tool_calls else "câu trả lời",
+        )
         if not response.tool_calls:
             return response.text
         messages.append(response.as_message())
-        messages.append(ChatMessage.tools([ToolResult(c.id, await execute(c)) for c in response.tool_calls]))
+        results = []
+        for call in response.tool_calls:
+            with timed(log, "công cụ %s (%s)", call.name, purpose):
+                results.append(ToolResult(call.id, await execute(call)))
+        messages.append(ChatMessage.tools(results))
     return None
+
+
+def prompt_chars(system: str, messages: Sequence[ChatMessage]) -> int:
+    """Độ dài (ký tự) phần chữ gửi cho model: system + các lượt + kết quả công cụ. Chỉ để ghi log."""
+    return len(system) + sum(len(m.text) + sum(len(r.content) for r in m.tool_results) for m in messages)

@@ -9,8 +9,9 @@
 5. Task trùng lặp: giữ dòng STT nhỏ hơn (bổ sung thông tin còn thiếu), dòng kia đánh dấu
    "Trùng với task #N".
 
-Sau khi rà xong, lưu "dấu vân tay" của sheet (kèm quy tắc rà soát): lần khởi động sau, sheet và
-quy tắc không đổi thì bỏ qua (không gọi LLM).
+Sau khi rà xong, lưu "dấu vân tay" của sheet (mã băm nội dung các dòng, kèm quy tắc rà soát): lần khởi
+động sau, sheet và quy tắc không đổi thì bỏ qua (không gọi LLM). Bot tự ghi sheet (xử lý tin nhắn, xác nhận
+sửa task) thì dấu vân tay được cập nhật theo (refresh_after_bot_write), nên chỉ sửa tay mới làm rà lại.
 """
 import asyncio
 import hashlib
@@ -75,6 +76,15 @@ def fingerprint(tasks: list[dict]) -> str:
     # Kèm quy tắc rà soát: đổi prompt / quy ước ngày thì lần khởi động sau rà lại dù sheet không đổi
     rules = [REVIEW_SYSTEM_PROMPT, DEADLINE_RULES]
     return hashlib.sha256(json.dumps([rules, rows], ensure_ascii=False).encode()).hexdigest()
+
+
+def refresh_after_bot_write(storage: Storage, chat_id: int, before: list[dict], after: list[dict]) -> None:
+    """Sheet vừa được chính bot ghi (xử lý tin nhắn, người dùng bấm xác nhận sửa task). Nếu ngay trước đó sheet
+    đang ở trạng thái đã rà soát (dấu vân tay khớp), lưu dấu vân tay mới: thay đổi của bot không cần rà lại, lần
+    khởi động sau chỉ rà soát khi có người sửa tay trên sheet. Sheet đã bị sửa tay từ trước (không khớp) thì để
+    nguyên, lần khởi động sau vẫn rà."""
+    if storage.review_fingerprint(chat_id) == fingerprint(before):
+        storage.save_review(chat_id, fingerprint(after))
 
 
 def find_issues(tasks: list[dict]) -> dict[str, list[int]]:
@@ -152,6 +162,7 @@ async def review_sheet(storage: Storage, sheet: TaskSheet, llm: LLMProvider, cha
             tools=[UPDATE_TOOL, MARK_TOOL],
             execute=execute,
             max_rounds=MAX_REVIEW_ROUNDS,
+            purpose="rà soát sheet",
         )
         if answer is None:
             raise RuntimeError("Model gọi công cụ quá nhiều vòng khi rà soát sheet")

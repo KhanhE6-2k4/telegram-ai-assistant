@@ -16,6 +16,7 @@ from collections.abc import Callable
 from typing import Any, Protocol
 
 from .storage import Storage
+from .timing import timed
 
 log = logging.getLogger(__name__)
 
@@ -69,7 +70,9 @@ class TaskSheet:
         self.ws = ws
         self.storage = storage
         self.chat_id = chat_id
-        self._rows = [list(map(str, r)) for r in ws.get_all_values()]
+        self.label = storage.chat_label(chat_id)
+        with timed(log, "đọc Google Sheet của chat %s (cả tab)", self.label):
+            self._rows = [list(map(str, r)) for r in ws.get_all_values()]
         if not self._rows:
             ws.append_row(HEADER)
             self._rows = [list(HEADER)]
@@ -103,7 +106,8 @@ class TaskSheet:
         """Thêm task mới ở cuối sheet với STT kế tiếp. Trả về STT."""
         stt = max((t["stt"] for t in self.rows()), default=0) + 1
         values = [str(task.get(f) or "") for f in FIELDS]
-        self.ws.append_row([stt, *values])
+        with timed(log, "ghi Google Sheet: thêm task #%d, chat %s", stt, self.label):
+            self.ws.append_row([stt, *values])
         self._rows.append([str(stt), *values])
         self.storage.record_task(self.chat_id, stt, day, created=True)
         return stt
@@ -114,11 +118,13 @@ class TaskSheet:
         if i is None:
             raise ValueError(f"Không có task STT {stt}")
         self._rows[i] = _pad(self._rows[i])
-        for field, value in changes.items():
-            if field not in FIELDS:
-                continue
-            self.ws.update(range_name=f"{_column(field)}{i + 1}", values=[[str(value)]])
-            self._rows[i][1 + FIELDS.index(field)] = str(value)
+        fields = [f for f in changes if f in FIELDS]
+        # Mỗi ô là một lần gọi Google API: sửa nhiều trường thì lâu tương ứng
+        with timed(log, "ghi Google Sheet: sửa task #%d (%d ô), chat %s", stt, len(fields), self.label):
+            for field in fields:
+                value = changes[field]
+                self.ws.update(range_name=f"{_column(field)}{i + 1}", values=[[str(value)]])
+                self._rows[i][1 + FIELDS.index(field)] = str(value)
         self.storage.record_task(self.chat_id, stt, day)
         return self.get(stt)
 
@@ -210,8 +216,10 @@ class SheetClient:
             hit = self._cache.get(chat_id)
             if hit and time.monotonic() - hit[0] < self.cache_seconds:
                 return hit[1]
-            ws = self._resolve(chat_id)
-            self._ensure_columns(ws)
+            # Chỉ khi chưa có trong bộ nhớ (hoặc quá cache_seconds): đọc danh sách tab của cả file sheet
+            with timed(log, "tìm tab Google Sheet của chat %s", self.label_of(chat_id)):
+                ws = self._resolve(chat_id)
+                self._ensure_columns(ws)
             self._cache[chat_id] = (time.monotonic(), ws)
             return ws
 

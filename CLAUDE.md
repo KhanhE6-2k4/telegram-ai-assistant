@@ -15,7 +15,9 @@ gitignored; activate the matching one before running commands:
 - `.venv`: bot and tests (`pip install -r requirements.txt pytest`).
 - `.venv-app`: only `briefcase`. Briefcase builds its own isolated environments from `requires` in
   `pyproject.toml` (`.briefcase/` for `briefcase dev`, `build/` for the app), so never pip-install app
-  dependencies into `.venv-app`; after changing `requires`, run with `-r`.
+  dependencies into `.venv-app`; after changing `requires`, run with `-r`. `briefcase create` installs app
+  requirements binary-only (`--only-binary :all:`): a dependency without a wheel on PyPI (e.g. `pyaes`, needed
+  by Telethon) needs a pure-Python wheel in `packaging/wheels/` (found via `requirement_installer_args`).
 
 ```bash
 # .venv
@@ -42,9 +44,9 @@ No linter/formatter is configured. Only one process may poll a given bot token (
   `main()` adds logging and `run_polling`), `post_init` (= `start_userbot` then `set_bot_commands`, shared
   with the runner), handlers, `BotState` (per-chat `asyncio.Lock`, `busy` set, in-memory
   `pending_edits`/`pending_picks`, one `Session`), `ingest` (store one message + mid-day compaction, used by userbot and
-  fallback), `supplement_chat` / `supplement_tracked` (backfill via userbot), retry loop `BotState.compact`,
+  fallback), `sync_chat` / `sync_tracked_chats` (message sync via userbot), retry loop `BotState.process`,
   scheduled jobs (`finalize_past_days` daily at `DAILY_SUMMARY_TIME`, `on_startup` ~10 s after start:
-  supplement → finalize → today → review). Jobs use `misfire_grace_time=None` because APScheduler's
+  sync → finalize → today → review). Jobs use `misfire_grace_time=None` because APScheduler's
   default 1 s grace silently skips them.
 - `bot/userbot.py`: `Userbot` (Telethon, imported lazily; `StringSession`, runs in the bot's asyncio loop):
   `NewMessage`/`MessageEdited` handlers forward only chats in `tracked`, `fetch_since` (backfill, FloodWait
@@ -56,18 +58,32 @@ No linter/formatter is configured. Only one process may poll a given bot token (
   succeed; a retry re-reads the sheet so partial writes don't duplicate tasks.
 - `bot/review.py`: startup sheet audit (assign missing STT in code; LLM fills assignee, normalizes relative
   deadlines by task's created day, marks non-tasks / duplicates). Skipped when the sheet fingerprint is
-  unchanged (`sheet_reviews` table).
-- `bot/qa.py`: question answering (`@bot` in groups, private commands) via tools `list_tasks` (sheet, default last 30 days) and `get_day`
-  (day summary + unprocessed messages); `propose_task_edit` only for editors, applied after button press.
+  unchanged (`sheet_reviews` table: sha256 of all task rows + review prompt + `DEADLINE_RULES`). Bot writes
+  (`BotState.process`, `apply_confirmed_edit`) call `refresh_after_bot_write`: if the sheet was reviewed just
+  before, the new fingerprint is saved, so only manual sheet edits trigger the next review.
+- `bot/qa.py`: question answering (`@bot` in groups, private commands) via tools `list_tasks` (sheet, default last 30 days), `get_day`
+  (one day: summary + unprocessed messages) and `get_period` (summaries of every day with messages in a range,
+  ≤ `MAX_PERIOD_DAYS` = 91, via `Storage.days_overview`; no raw messages); `propose_task_edit` only for editors,
+  applied after button press. `_preload` (and `get_period`) include the chat's data coverage (`_coverage` from
+  `Storage.data_coverage`: `chats.tracked_since` = first tracking day, `chats.data_from` = start of the first
+  sync, set once; old chats fall back to the first message day): days on/after `data_from` without messages
+  had no messages, days before are unknown. `_preload` also appends the
+  default `list_tasks` result and today's `get_day` to the question, so most answers
+  take one LLM round; the system prompt tells the model not to re-call tools for that data. One `TaskSheet`
+  per answer (`memo`): the sheet is read once for preload + tools. History turns carry only question text.
 - `bot/sheets.py`: `TaskSheet` (one tab, reads once, writes single cells) and `SheetClient` (finds tab by
   developer metadata `telegram_chat_id`, never by title; tab title follows group name unless user renamed it;
   auto-migrates legacy chat-id-named tabs and 5-column tabs by inserting column C).
 - `bot/storage.py`: SQLite schema + light migrations in `Storage._migrate`. `format_chat` / `Storage.chat_label`
   give the log label `"Title" (@username, chat_id)`; logs about a chat use it (`SheetClient` / `Userbot` get
   `label_of`), never a bare chat id. `chats.username` is filled from bot updates and userbot entities.
-- `bot/dates.py`: `calendar_text(day)` (weekday-labelled weeks Mon–Sun + month ends, computed in code) and
-  `DEADLINE_RULES` (Vietnamese phrase conventions), injected into the task, review and Q&A prompts so
-  the model looks dates up instead of computing weekdays. Review fingerprint includes the rules.
+- `bot/dates.py`: `calendar_text(day)` (weekday-labelled weeks Mon–Sun from 2 weeks back to 2 weeks ahead,
+  last / this month ranges, month ends, computed in code) and `DEADLINE_RULES` (Vietnamese future phrase
+  conventions), injected into the task, review and Q&A prompts so the model looks dates up instead of
+  computing weekdays. Review fingerprint includes `DEADLINE_RULES` (not the calendar). Q&A also gets
+  `PAST_RULES` (hôm qua, thứ N tuần trước, tháng trước...), every question line starts with
+  `[day_label(ngày hỏi)]` (`qa.question_line`; topic history stores `(question, answer, day)`), and tool
+  date arguments go through `check_day` (bad format / non-existent date → error result, model retries).
 - `bot/checks.py`: `check_llm` / `check_telegram` / `check_sheet` / `run_checks`, shared by `--check`
   and the desktop app's "Kiểm tra kết nối"; return results instead of printing. With a Telegram API ID the
   "Telegram" item also runs `check_userbot` (no separate item).
@@ -76,6 +92,14 @@ No linter/formatter is configured. Only one process may poll a given bot token (
   desktop app: `ensure_userbot_session` (stored session, else login window; cancel → fallback mode with a
   status note). The session string is stored only in keyring and never logged (the CLI
   `bot/userbot_login.py` still prints it once).
+- `bot/timing.py`: `timed` / `log_elapsed` write `Thời gian - <đoạn>: X s` log lines (no message content);
+  used for LLM rounds and tools (`run_tool_loop(purpose=)`), both `process_day` phases, sheet reads/writes,
+  message sync, lock waits and whole requests. README "Đo thời gian" lists the lines.
+- Vietnamese terms are fixed (also in logs and docs): **đồng bộ tin nhắn** = userbot fetches messages not yet
+  in the DB (`sync_*`); **xử lý tin nhắn** = write tasks to the sheet + update the day summary
+  (`BotState.process` / `process_day`); **chốt ngày** = process a past day completely and mark it done
+  (`finalize`). Don't use "bù tin" / "nén". Env vars `COMPACT_*` and column `compacted_until` keep their old
+  names (renaming breaks existing `.env` files and databases).
 - `bot/runner.py` `BotRunner`: runs `build_application(config)` in its own thread + asyncio loop
   (initialize → post_init → start_polling → start; stop in reverse incl. `stop_userbot`, closes the DB). Network errors while
   connecting retry with backoff up to 5 min (`Đang chờ mạng`); other errors end in `Status.ERROR`.
@@ -104,6 +128,11 @@ No linter/formatter is configured. Only one process may poll a given bot token (
 - A row is a task only with a concrete assignee: `add_task` without one (or with the `Tất cả` label) is
   rejected in code. Non-task rows get assignee `Tất cả`; duplicates get description `Trùng với task #N`.
   `is_marked()` excludes both from assignee backfill and `<task>`. The model never deletes rows.
+  Phase A (`run_task_tool(guard=True)`) refuses `update_task` on marked rows and on tasks whose `updated_day`
+  is after the day being processed (older messages must not undo newer changes); review uses `guard=False`.
+- A confirmed task edit (`on_edit_button` → `apply_confirmed_edit`) also stores a note in today's messages
+  (`Storage.add_note`: negative `message_id`, sender `BOT_NOTE_NAME` = "Bot (ghi chú)"), so the day summary
+  records the change; task / summary prompts tell the model these notes are already applied, not new tasks.
 - A message's `day` is its original send time converted to `TIMEZONE`. Pending = `id > compacted_until` or
   `edit_pending = 1`. Edited or late-arriving messages of a finalized day reopen it (`finalized = 0`) so the
   next finalize run re-processes it.
@@ -118,7 +147,10 @@ No linter/formatter is configured. Only one process may poll a given bot token (
   `e`, menu scoped to `BotCommandScopeChat(owner)`), checked offline → userbot configured →
   `effective_user.id == userbot.me.id`. Menu taps send an empty command, so an empty / name-only command
   shows pick buttons (`pick:<id>:<i>`, `on_pick_chat`). A chosen chat starts a topic (`start_session`:
-  `prepare_chat` = track + backfill + compact pending days, once): `BotState.session` (RAM only, a single one,
+  `prepare_chat` = track + sync (skipped if the chat is in `BotState.synced`: synced earlier in this run, so the
+  userbot already receives its messages live; untracking removes it) + process pending days, once).
+  `sync_chat` counts only messages really inserted (`add_message` returns False for the re-fetched last message).
+  `BotState.session` (RAM only, a single one,
   replaced by the next `/p`/`/g`, dropped by `/e`, restart, or `SESSION_TTL` = 1 h since the last message).
   Every plain owner message in the DM (`on_private_message`) is a question of that topic: `QA.answer(history=)`
   gets the last `MAX_SESSION_TURNS` (question, answer) pairs as text-only `ChatMessage`s, the answer ends with

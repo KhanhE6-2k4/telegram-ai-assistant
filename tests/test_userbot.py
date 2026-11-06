@@ -77,12 +77,12 @@ def fields(mid, text, sent_at, chat_id=-1):
 def ingest_state(threshold=60000):
     st = make_state()
     st.config.compact_threshold_chars = threshold
-    st.compacts = []
+    st.processed = []
 
-    async def compact(chat_id, day, finalize, retry=True, keep_recent=True):
-        st.compacts.append((chat_id, day, finalize))
+    async def process(chat_id, day, finalize, retry=True, keep_recent=True):
+        st.processed.append((chat_id, day, finalize))
 
-    st.compact = compact
+    st.process = process
     return st
 
 
@@ -102,7 +102,7 @@ def test_ingest_stores_edits_and_reopens_finalized_day():
     s = st.storage.get_summary(-1, "2026-10-28")
     assert not s.finalized  # ngày đã chốt được mở lại
     assert st.storage.pending_messages(-1, "2026-10-28", s.compacted_until)[0].edit_pending == 1
-    assert app.tasks == []  # ngày cũ: không nén giữa ngày
+    assert app.tasks == []  # ngày cũ: không xử lý giữa ngày
 
 
 def test_edit_with_unchanged_text_is_ignored():
@@ -114,7 +114,7 @@ def test_edit_with_unchanged_text_is_ignored():
     assert st.storage.get_summary(-1, "2026-10-28").finalized
 
 
-def test_ingest_compacts_today_over_threshold():
+def test_ingest_processes_today_over_threshold():
     st, app = ingest_state(threshold=10), RecordingApp(None)
     today = datetime(2026, 10, 29, 9, tzinfo=TZ)
     m.ingest(app, st, fields(1, "ngắn", today), edited=False)
@@ -122,13 +122,13 @@ def test_ingest_compacts_today_over_threshold():
     m.ingest(app, st, fields(2, "tin dài hơn ngưỡng", today), edited=False)
     assert len(app.tasks) == 1
     asyncio.run(app.tasks[0])
-    assert st.compacts == [(-1, "2026-10-29", False)]
-    # Bù tin (compact=False): không nén, người gọi tự xử lý
-    m.ingest(app, st, fields(3, "thêm một tin dài nữa", today), edited=False, compact=False)
+    assert st.processed == [(-1, "2026-10-29", False)]
+    # Đồng bộ tin nhắn (process=False): chỉ lưu, người gọi tự quyết định xử lý
+    m.ingest(app, st, fields(3, "thêm một tin dài nữa", today), edited=False, process=False)
     assert len(app.tasks) == 1
 
 
-# ---- bù tin ----
+# ---- đồng bộ tin nhắn ----
 
 class FakeUserbot:
     """users / groups: [(chat_id, tên, username)], gần đây trước (như iter_dialogs)."""
@@ -166,24 +166,37 @@ class FakeUserbot:
         return self.groups[:10]
 
 
-def test_supplement_first_time_takes_history_days_then_from_last_message():
+def test_sync_first_time_takes_history_days_then_from_last_message():
     now = datetime.now(TZ)
     history = {-1: [fields(1, "cũ quá", now - timedelta(days=10)), fields(2, "tuần này", now - timedelta(days=3)),
                     fields(3, "vừa xong", now - timedelta(hours=1))]}
     ub = FakeUserbot(history)
     st, app = make_state(ub), RecordingApp(None)
-    assert asyncio.run(m.supplement_chat(app, st, -1)) == 2
+    assert asyncio.run(m.sync_chat(app, st, -1)) == 2
     assert texts(st) == ["tuần này", "vừa xong"]  # chỉ 7 ngày gần nhất
     assert abs(ub.fetches[0][1] - (now - timedelta(days=7))) < timedelta(minutes=1)
 
     history[-1].append(fields(4, "tin mới", now))
-    asyncio.run(m.supplement_chat(app, st, -1))
+    asyncio.run(m.sync_chat(app, st, -1))
     assert ub.fetches[1][1] == now - timedelta(hours=1)  # từ tin cuối đã lưu (tính cả nó)
     assert texts(st) == ["tuần này", "vừa xong", "tin mới"]  # tin trùng bị bỏ
     assert app.tasks == []
 
 
-def test_supplement_tracked_covers_only_tracked_chats_from_before_start():
+def test_first_sync_records_coverage_dates():
+    now = datetime.now(TZ)
+    ub = FakeUserbot({-1: [fields(1, "tuần này", now - timedelta(days=3))]})
+    st, app = make_state(ub), RecordingApp(None)
+    m.track_chat(st, -1, "Team A")  # ngày bắt đầu theo dõi = st.today()
+    asyncio.run(m.sync_chat(app, st, -1))
+    seven_days_ago = (now - timedelta(days=7)).date().isoformat()
+    # Có đủ tin nhắn từ ngày lần đồng bộ đầu bắt đầu lấy, dù ngày đó không ai nhắn
+    assert st.storage.data_coverage(-1) == ("2026-10-29", seven_days_ago)
+    asyncio.run(m.sync_chat(app, st, -1))  # lần sau không đổi mốc
+    assert st.storage.data_coverage(-1)[1] == seven_days_ago
+
+
+def test_sync_tracked_chats_covers_only_tracked_chats_from_before_start():
     now = datetime.now(TZ)
     ub = FakeUserbot({-1: [fields(1, "a", now - timedelta(days=1))], -2: [fields(1, "b", now, chat_id=-2)]})
     st, app = make_state(ub), RecordingApp(None)
@@ -192,15 +205,47 @@ def test_supplement_tracked_covers_only_tracked_chats_from_before_start():
     # Tin userbot nhận trực tiếp sau khi khởi động không làm bỏ sót tin gửi lúc bot tắt
     ub.started_at = now - timedelta(minutes=5)
     m.ingest(app, st, fields(9, "tin nhận trực tiếp", now - timedelta(minutes=1)), edited=False)
-    asyncio.run(m.supplement_tracked(app, st))
+    asyncio.run(m.sync_tracked_chats(app, st))
     assert [c for c, _ in ub.fetches] == [-1]
     assert ub.fetches[0][1] < now - timedelta(days=6)
     assert sorted(texts(st)) == ["a", "tin nhận trực tiếp"]
 
 
-def test_no_userbot_no_supplement():
+def test_no_userbot_no_sync():
     st = make_state()
-    assert asyncio.run(m.supplement_chat(RecordingApp(None), st, -1)) == 0
+    assert asyncio.run(m.sync_chat(RecordingApp(None), st, -1)) == 0
+
+
+def test_sync_counts_only_messages_really_added(caplog):
+    caplog.set_level("INFO")
+    now = datetime.now(TZ)
+    history = {-1: [fields(1, "a", now - timedelta(hours=2)), fields(2, "b", now - timedelta(hours=1))]}
+    ub = FakeUserbot(history)
+    st, app = make_state(ub), RecordingApp(None)
+    assert asyncio.run(m.sync_chat(app, st, -1)) == 2
+    assert -1 in st.synced
+    # Lần sau lấy lại tin cuối đã có (tính cả tin gửi cùng giây): DB bỏ qua, không đếm là tin mới
+    assert asyncio.run(m.sync_chat(app, st, -1)) == 0
+    assert "Đồng bộ tin nhắn: không có tin mới" in caplog.messages[-1]
+    history[-1].append(fields(3, "c", now))
+    assert asyncio.run(m.sync_chat(app, st, -1)) == 1
+
+
+def test_sync_of_unreadable_chat_is_not_marked_synced():
+    class NoAccess(FakeUserbot):
+        async def fetch_since(self, chat_id, since):
+            return None  # chủ bot không ở trong chat
+
+    st = make_state(NoAccess())
+    assert asyncio.run(m.sync_chat(RecordingApp(None), st, -1)) == 0
+    assert st.synced == set()
+
+
+def test_untrack_requires_sync_again():
+    st = make_state(FakeUserbot())
+    st.synced.add(-1)
+    m.untrack_chat(st, -1)
+    assert st.synced == set()
 
 
 # ---- theo dõi chat ----
@@ -220,7 +265,7 @@ def test_bot_removed_from_group_untracks_it():
     asyncio.run(m.remember_chat(added, context))
     asyncio.run(m.on_my_chat_member(added, context))
     assert st.storage.tracked_chats() == [-1] and ub.tracked == {-1}
-    assert len(app.tasks) == 1  # chat mới theo dõi: bù lịch sử
+    assert len(app.tasks) == 1  # chat mới theo dõi: đồng bộ tin nhắn
     asyncio.run(app.tasks.pop())
     removed = member_update("kicked")
     asyncio.run(m.remember_chat(removed, context))
@@ -271,12 +316,12 @@ def private_state(ub=None, proposals=()):
     st.today = lambda: datetime.now(TZ).date().isoformat()
     st.started_at = datetime(2026, 1, 1, tzinfo=timezone.utc)
     st.qa = FakeQA(proposals)
-    st.compacts = []
+    st.processed = []
 
-    async def compact(chat_id, day, finalize, retry=True, keep_recent=True):
-        st.compacts.append((chat_id, day, finalize, retry, keep_recent))
+    async def process(chat_id, day, finalize, retry=True, keep_recent=True):
+        st.processed.append((chat_id, day, finalize, retry, keep_recent))
 
-    st.compact = compact
+    st.process = process
     return st
 
 
@@ -361,6 +406,20 @@ def say(st, context, text, user_id=OWNER, date=None):
     return msg
 
 
+def test_p_skips_sync_for_chat_already_synced_in_this_run():
+    ub = FakeUserbot(history={55: [fields(1, "Lan làm slide nhé", datetime.now(TZ), chat_id=55)]}, users=[LAN])
+    st = private_state(ub)
+    st.synced.add(55)  # ví dụ đã đồng bộ lúc khởi động
+    msg, _ = run_command(st, m.cmd_p, "/p @lan tóm tắt")
+    assert ub.fetches == []  # không gọi Telegram lại
+    assert msg.sent == ["Trả lời" + FOOTER]
+    # Chat chưa đồng bộ: mở chủ đề thì đồng bộ, lần mở sau thì bỏ qua
+    st2 = private_state(FakeUserbot(users=[LAN]))
+    run_command(st2, m.cmd_p, "/p @lan tóm tắt")
+    run_command(st2, m.cmd_p, "/p @lan tóm tắt")
+    assert len(st2.userbot.fetches) == 1
+
+
 def test_p_with_question_starts_session_and_follow_up_has_context():
     now = datetime.now(TZ)
     yesterday = now - timedelta(days=1)
@@ -374,21 +433,25 @@ def test_p_with_question_starts_session_and_follow_up_has_context():
     assert st.storage.chat_label(55) == '"Lan" (@lan, 55)'
     assert texts(st) == ["Lan làm slide nhé", "ok anh"]
     # Mọi ngày còn tin chưa xử lý: ngày trước được chốt, hôm nay thì không; không chờ thử lại
-    assert st.compacts == [
+    assert st.processed == [
         (55, yesterday.date().isoformat(), True, False, False),
         (55, now.date().isoformat(), False, False, False),
     ]
     assert st.qa.calls == [(55, "Chat riêng với Lan", "Chủ bot", "tóm tắt việc cần làm", True)]
     assert msg.sent == ["Trả lời" + FOOTER]
 
-    # Câu hỏi tiếp: không cần cú pháp, có ngữ cảnh lượt trước, không bù / xử lý lại
+    # Câu hỏi tiếp: không cần cú pháp, có ngữ cảnh lượt trước, không đồng bộ / xử lý lại
     follow = say(st, context, "việc nào gấp nhất?")
     assert follow.sent == ["Trả lời 2" + FOOTER]
     assert st.qa.calls[1] == (55, "Chat riêng với Lan", "Chủ bot", "việc nào gấp nhất?", True)
-    assert st.qa.histories[1] == [("tóm tắt việc cần làm", "Trả lời")]
-    assert len(st.compacts) == 2 and len(ub.fetches) == 1
+    today = st.today()
+    # Lịch sử giữ ngày hỏi của từng câu (ghi ở đầu câu hỏi khi gửi lại model)
+    assert st.qa.histories[1] == [("tóm tắt việc cần làm", "Trả lời", today)]
+    assert len(st.processed) == 2 and len(ub.fetches) == 1
     say(st, context, "còn gì nữa?")
-    assert st.qa.histories[2] == [("tóm tắt việc cần làm", "Trả lời"), ("việc nào gấp nhất?", "Trả lời 2")]
+    assert st.qa.histories[2] == [
+        ("tóm tắt việc cần làm", "Trả lời", today), ("việc nào gấp nhất?", "Trả lời 2", today),
+    ]
 
 
 def test_empty_p_picks_user_then_messages_go_to_session():
@@ -442,7 +505,7 @@ def test_new_session_replaces_old_context():
     assert st.qa.histories[1] == []  # chủ đề mới: không mang ngữ cảnh cũ
     say(st, context, "của ai?")
     assert st.qa.calls[2][:2] == (-100, "Team A")
-    assert st.qa.histories[2] == [("task nào trễ?", "Trả lời 2")]
+    assert st.qa.histories[2] == [("task nào trễ?", "Trả lời 2", st.today())]
 
 
 def test_session_expires_after_an_hour_without_messages():
@@ -621,6 +684,10 @@ def test_migration_adds_username_column(tmp_path):
     assert s.chat_label(-1) == '"Team A" (-1)'
     s.upsert_chat(-1, "Team A", "team_a")
     assert s.chat_label(-1) == '"Team A" (@team_a, -1)'
+    # Cột phạm vi dữ liệu cũng được thêm; chat cũ chưa có mốc
+    assert s.data_coverage(-1) == (None, None)
+    s.set_data_from(-1, "2026-10-29")
+    assert s.data_coverage(-1) == (None, "2026-10-29")
 
 
 # ---- menu lệnh ----

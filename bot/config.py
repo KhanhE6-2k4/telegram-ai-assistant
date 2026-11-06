@@ -17,7 +17,8 @@ class Config:
     timezone: ZoneInfo
     # Giờ chốt các ngày trước (ghi task + tóm tắt), dạng "HH:MM" theo múi giờ ở trên
     daily_summary_time: str
-    # Khi phần tin nhắn chưa nén trong ngày vượt quá số ký tự này thì nén lại
+    # Tin nhắn chưa xử lý của hôm nay vượt quá số ký tự này thì xử lý tin nhắn ngay giữa ngày
+    # (tên biến môi trường COMPACT_* giữ nguyên để không làm hỏng file .env đang dùng)
     compact_threshold_chars: int
     # Số lần thử tối đa cho mỗi lần xử lý (LLM + ghi sheet), và thời gian chờ lần đầu (nhân đôi mỗi lần)
     compact_max_attempts: int

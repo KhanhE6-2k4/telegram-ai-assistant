@@ -4,7 +4,8 @@ Bot API chỉ thấy tin của nhóm có bot, tính từ lúc bot vào, và khô
 cũ. Userbot đăng nhập bằng tài khoản của chủ bot nên đọc được mọi chat chủ bot tham gia. Nó chạy chung
 tiến trình và vòng lặp asyncio với bot:
 - theo dõi liên tục tin mới / tin sửa của các chat trong `tracked`, chuyển cho `on_message`;
-- `fetch_since` lấy bù tin (lúc khởi động, khi có yêu cầu riêng của chủ bot);
+- `fetch_since` lấy những tin chưa có trong DB để đồng bộ tin nhắn (lúc khởi động, khi mở chủ đề /p /g,
+  khi bắt đầu theo dõi một chat);
 - `find_users` / `find_groups` / `recent_users` / `recent_groups` tìm chat cho lệnh /p,
   /g. Mỗi chat là bộ (chat_id, tên, username | None).
 
@@ -20,7 +21,7 @@ from zoneinfo import ZoneInfo
 
 log = logging.getLogger(__name__)
 
-# FloodWait dài hơn mức này thì bỏ chat đó, để lần bù sau
+# Telegram yêu cầu chờ (FloodWait) lâu hơn mức này thì bỏ qua chat đó, để lần đồng bộ tin nhắn sau
 MAX_FLOOD_WAIT_SECONDS = 300
 # Số chat tối đa trả về khi tìm / liệt kê (bằng số nút chọn tối đa của bot)
 MAX_CHOICES = 10
@@ -75,7 +76,7 @@ class Userbot:
         self._session = session
         self.timezone = timezone
         self.on_message = on_message
-        # Gọi khi đọc được thông tin chat lúc bù tin (cập nhật tên / username trong DB)
+        # Gọi khi đọc được thông tin chat lúc đồng bộ tin nhắn (cập nhật tên / username trong DB)
         self.on_chat = on_chat
         # Nhãn chat cho log (tên + username + chat id), xem Storage.chat_label
         self.label_of = label_of
@@ -203,10 +204,14 @@ class Userbot:
             except errors.FloodWaitError as e:
                 if e.seconds > MAX_FLOOD_WAIT_SECONDS:
                     log.warning(
-                        "Telegram bắt chờ %s giây khi lấy tin chat %s: để lần bù sau", e.seconds, self.label_of(chat_id)
+                        "Telegram yêu cầu chờ %s giây khi lấy tin nhắn của chat %s: bỏ qua, để lần đồng bộ sau",
+                        e.seconds, self.label_of(chat_id),
                     )
                     return out
-                log.info("Telegram bắt chờ %s giây khi lấy tin chat %s", e.seconds, self.label_of(chat_id))
+                log.info(
+                    "Thời gian - Telegram yêu cầu chờ %s giây khi lấy tin nhắn của chat %s: đang chờ",
+                    e.seconds, self.label_of(chat_id),
+                )
                 await asyncio.sleep(e.seconds)
 
     async def _direct(self, ref: str):

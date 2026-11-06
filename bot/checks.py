@@ -67,6 +67,7 @@ async def check_llm(
         tools=[weather],
         execute=execute,
         max_rounds=4,
+        purpose="kiểm tra kết nối",
     )
     report(f"3. Vòng gọi công cụ: {called} -> {answer}")
     return f"{llm.name} / {llm.model}"

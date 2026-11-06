@@ -26,6 +26,11 @@ requires = [
     "keyring>=25",
     "tzdata",
 ]
+# Briefcase cài gói của app ở chế độ chỉ nhận wheel (--only-binary :all:), mà pyaes (Telethon cần) trên PyPI
+# chỉ có bản mã nguồn. pyaes là thuần Python: wheel tự đóng sẵn trong packaging/wheels (tạo lại bằng
+# `pip wheel pyaes==1.6.1 --no-deps -w packaging/wheels`). Đường dẫn bắt đầu bằng "./" được Briefcase tính
+# từ thư mục dự án.
+requirement_installer_args = ["--find-links", "./packaging/wheels"]
 test_requires = [
     "pytest",
 ]

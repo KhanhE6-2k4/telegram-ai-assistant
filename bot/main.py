@@ -1,8 +1,14 @@
 """Điểm khởi chạy bot: python -m bot.main [--provider TÊN] [--model MODEL] [--base-url URL]
 
 Vai trò:
-- Userbot (bot/userbot.py, tài khoản của chủ bot): nguồn tin nhắn duy nhất, theo dõi và bù tin của
-  các chat đang theo dõi (nhóm có bot, chat chủ bot đã mở chủ đề bằng /p, /g).
+- Userbot (bot/userbot.py, tài khoản của chủ bot): nguồn tin nhắn duy nhất. Nhận tin mới / tin sửa và
+  đồng bộ tin nhắn (lấy những tin chưa có trong DB) của các chat đang theo dõi (nhóm có bot, chat chủ bot
+  đã mở chủ đề bằng /p, /g).
+
+Từ ngữ dùng thống nhất trong code và log:
+- đồng bộ tin nhắn: userbot lấy từ Telegram những tin chưa có trong DB (lần đầu: USERBOT_HISTORY_DAYS ngày).
+- xử lý tin nhắn: ghi task lên Google Sheet + viết bản tóm tắt cho các tin chưa xử lý của một ngày.
+- chốt ngày: xử lý toàn bộ tin của một ngày đã qua và đánh dấu ngày đó đã xong.
 - Bot BotFather (file này): chỉ nhận yêu cầu và trả lời. Trong nhóm chỉ có tag @bot; lệnh "/" (/p, /g,
   /e: chủ đề hỏi đáp về một chat) chỉ có trong chat riêng của chủ bot. Không cấu hình userbot thì bot tự lưu tin nhóm (chế độ dự phòng).
 """
@@ -28,10 +34,11 @@ from telegram.ext import (
 from .config import Config, llm_settings, load_config, load_env_file
 from .providers import available_providers, create_provider
 from .qa import QA
-from .review import review_sheet
-from .sheets import FIELDS, SheetClient, TaskSheet, apply_edit, is_marked
+from .review import refresh_after_bot_write, review_sheet
+from .sheets import FIELDS, SheetClient, TaskSheet, is_marked
 from .storage import Storage
 from .summarizer import pending_chars, process_day
+from .timing import timed
 
 log = logging.getLogger("bot")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -65,6 +72,9 @@ class BotState:
         self.qa = QA(self.storage, self.llm, self.sheets)
         # Userbot (tạo ở build_application, đăng nhập ở post_init). None = chế độ dự phòng
         self.userbot = None
+        # Chat đã đồng bộ tin nhắn trong lần chạy này: từ đó userbot nhận trực tiếp mọi tin mới của chat,
+        # nên mở chủ đề không cần đồng bộ lại
+        self.synced: set[int] = set()
         # Thời điểm bot bắt đầu chạy (làm tròn xuống giây, như ngày giờ tin nhắn Telegram)
         self.started_at = datetime.now(timezone.utc).replace(microsecond=0)
 
@@ -74,34 +84,38 @@ class BotState:
     def task_sheet(self, chat_id: int) -> TaskSheet:
         return TaskSheet(self.sheets.worksheet_for(chat_id), self.storage, chat_id)
 
-    async def compact(
+    async def process(
         self, chat_id: int, day: str, finalize: bool, retry: bool = True, keep_recent: bool = True
     ) -> bool:
-        """Ghi task lên sheet rồi tóm tắt. Thử lại tới COMPACT_MAX_ATTEMPTS lần cho đến khi
-        cả LLM lẫn Google Sheet đều thành công. Trả về True nếu thành công.
+        """Xử lý tin nhắn của một ngày: ghi task lên sheet rồi viết tóm tắt. Thử lại tới COMPACT_MAX_ATTEMPTS
+        lần cho đến khi cả LLM lẫn Google Sheet đều thành công. Trả về True nếu thành công.
         keep_recent=False: xử lý cả các tin gần nhất (không giữ lại ở dạng gốc)."""
         attempts = self.config.compact_max_attempts if retry else 1
+        label = self.storage.chat_label(chat_id)
         self.busy.add((chat_id, day))
         try:
             for attempt in range(1, attempts + 1):
-                async with self.locks[chat_id]:
-                    try:
-                        sheet = await asyncio.to_thread(self.task_sheet, chat_id)
-                        await process_day(self.storage, sheet, self.llm, chat_id, day, finalize, keep_recent)
-                        return True
-                    except Exception:
-                        log.exception(
-                            "Xử lý chat %s ngày %s thất bại (lần %d/%d)",
-                            self.storage.chat_label(chat_id), day, attempt, attempts,
-                        )
-                        # Có thể tab đã bị xoá / đổi trên sheet: lần thử sau tra lại tab từ đầu
-                        self.sheets.forget(chat_id)
+                await self.acquire_chat_lock(chat_id, label)
+                try:
+                    sheet = await asyncio.to_thread(self.task_sheet, chat_id)
+                    before = sheet.rows()
+                    await process_day(self.storage, sheet, self.llm, chat_id, day, finalize, keep_recent)
+                    # Thay đổi do bot ghi: không làm lần khởi động sau phải rà soát lại sheet
+                    refresh_after_bot_write(self.storage, chat_id, before, sheet.rows())
+                    return True
+                except Exception:
+                    log.exception(
+                        "Xử lý tin nhắn của chat %s ngày %s thất bại (lần %d/%d)", label, day, attempt, attempts
+                    )
+                    # Có thể tab đã bị xoá / đổi trên sheet: lần thử sau tra lại tab từ đầu
+                    self.sheets.forget(chat_id)
+                finally:
+                    self.locks[chat_id].release()
                 if attempt < attempts:
                     # Chờ ngoài khoá để các thao tác khác (bấm Xác nhận...) không bị kẹt
                     await asyncio.sleep(self.config.compact_retry_delay_seconds * 2 ** (attempt - 1))
             log.error(
-                "Bỏ qua chat %s ngày %s sau %d lần thử, sẽ xử lý lại ở lần chốt sau",
-                self.storage.chat_label(chat_id), day, attempts,
+                "Bỏ qua chat %s ngày %s sau %d lần thử, sẽ xử lý lại ở lần chốt ngày sau", label, day, attempts
             )
             return False
         finally:
@@ -110,13 +124,26 @@ class BotState:
     async def review(self, chat_id: int) -> None:
         """Rà soát sheet của chat (thiếu người thực hiện, deadline chưa chuẩn, dòng không phải task,
         task trùng, dòng thiếu STT). Lỗi thì ghi log; lần khởi động sau rà lại."""
-        async with self.locks[chat_id]:
-            try:
+        label = self.storage.chat_label(chat_id)
+        await self.acquire_chat_lock(chat_id, label)
+        try:
+            with timed(log, "rà soát sheet của chat %s", label):
                 sheet = await asyncio.to_thread(self.task_sheet, chat_id)
                 await review_sheet(self.storage, sheet, self.llm, chat_id, self.today())
-            except Exception:
-                log.exception("Rà soát sheet của chat %s thất bại", self.storage.chat_label(chat_id))
-                self.sheets.forget(chat_id)
+        except Exception:
+            log.exception("Rà soát sheet của chat %s thất bại", label)
+            self.sheets.forget(chat_id)
+        finally:
+            self.locks[chat_id].release()
+
+    async def acquire_chat_lock(self, chat_id: int, label: str) -> None:
+        """Lấy khoá của chat. Phải chờ (chat đang có lượt xử lý / rà soát khác) thì ghi thời gian chờ."""
+        lock = self.locks[chat_id]
+        if not lock.locked():
+            await lock.acquire()
+            return
+        with timed(log, "chờ khoá của chat %s (đang có lượt xử lý khác)", label):
+            await lock.acquire()
 
 
 def state_of(context: ContextTypes.DEFAULT_TYPE) -> BotState:
@@ -132,32 +159,36 @@ def active_userbot(st):
 GROUP_CHAT_TYPES = ("group", "supergroup")
 
 
-# ---- lưu tin, theo dõi chat, bù tin ----
+# ---- lưu tin, theo dõi chat, đồng bộ tin nhắn ----
 
-def ingest(app, st, fields: dict, edited: bool, compact: bool = True) -> None:
+def ingest(app, st, fields: dict, edited: bool, process: bool = True) -> bool:
     """Lưu một tin hội thoại (mới hoặc bị sửa), dùng chung cho userbot và chế độ dự phòng.
+    Trả về True nếu là tin mới được thêm vào DB (tin sửa luôn trả về False).
 
     UNIQUE (chat_id, message_id) chặn tin trùng; tin mới / tin sửa của ngày đã chốt mở lại ngày đó.
-    compact=True: hôm nay vượt COMPACT_THRESHOLD_CHARS thì nén giữa ngày (chạy nền qua app.create_task).
+    process=True: tin chưa xử lý của hôm nay vượt COMPACT_THRESHOLD_CHARS ký tự thì xử lý tin nhắn ngay giữa
+    ngày (chạy nền qua app.create_task).
     """
+    added = False
     if edited:
         st.storage.edit_message(**fields)
     else:
-        st.storage.add_message(**fields)
+        added = st.storage.add_message(**fields)
     chat_id, day = fields["chat_id"], fields["sent_at"].date().isoformat()
-    # Ngày cũ (tin sửa lại) để lần chốt 00:01 xử lý; chỉ nén giữa ngày cho hôm nay
+    # Ngày cũ (tin sửa lại) để lần chốt ngày 00:01 xử lý; chỉ xử lý giữa ngày cho hôm nay
     if (
-        compact
+        process
         and day == st.today()
         and (chat_id, day) not in st.busy
         and pending_chars(st.storage, chat_id, day) > st.config.compact_threshold_chars
     ):
-        app.create_task(st.compact(chat_id, day, finalize=False))
+        app.create_task(st.process(chat_id, day, finalize=False))
+    return added
 
 
 def track_chat(st, chat_id: int, title: str | None, username: str | None = None) -> bool:
     """Đánh dấu userbot theo dõi chat (DB + tập trong bộ nhớ). True nếu trước đó chưa theo dõi."""
-    new = st.storage.track_chat(chat_id, title, username)
+    new = st.storage.track_chat(chat_id, title, username, today=st.today())
     ub = getattr(st, "userbot", None)
     if ub is not None:
         ub.tracked.add(chat_id)
@@ -168,45 +199,61 @@ def track_chat(st, chat_id: int, title: str | None, username: str | None = None)
 
 def untrack_chat(st, chat_id: int) -> None:
     st.storage.untrack_chat(chat_id)
+    # Thôi theo dõi: userbot không nhận tin của chat nữa, lần theo dõi sau phải đồng bộ lại
+    st.synced.discard(chat_id)
     ub = getattr(st, "userbot", None)
     if ub is not None:
         ub.tracked.discard(chat_id)
 
 
-async def supplement_chat(app, st, chat_id: int, before: datetime | None = None) -> int:
-    """Bù tin của chat qua userbot: từ tin cuối đã lưu (gửi trước `before`, mặc định bây giờ), chat chưa
-    có tin thì từ USERBOT_HISTORY_DAYS ngày trước. Không nén ở đây: người gọi tự xử lý. Trả về số tin lấy được."""
+async def sync_chat(app, st, chat_id: int, before: datetime | None = None) -> int:
+    """Đồng bộ tin nhắn của chat qua userbot: lấy từ Telegram những tin chưa có trong DB, tính từ tin cuối đã
+    lưu (gửi trước `before`, mặc định bây giờ); chat chưa có tin thì từ USERBOT_HISTORY_DAYS ngày trước.
+    Chỉ lưu, không xử lý tin nhắn: người gọi tự quyết định. Trả về số tin mới thật sự được lưu.
+
+    Mốc tính theo thời gian gửi, và tính cả tin gửi đúng thời điểm của tin cuối: Telegram chỉ ghi thời gian
+    tới giây, lấy từ sau mốc đó sẽ bỏ sót tin khác gửi cùng giây. Vì vậy lần nào cũng lấy lại ít nhất tin cuối
+    đã có; DB bỏ qua tin đó (UNIQUE (chat_id, message_id)) và nó không được đếm là tin mới."""
     ub = active_userbot(st)
     if ub is None:
         return 0
     tz = st.config.timezone
     last = st.storage.last_sent_at(chat_id, before or datetime.now(tz))
     since = last or datetime.now(tz) - timedelta(days=st.config.userbot_history_days)
-    fetched = await ub.fetch_since(chat_id, since)
-    for fields in fetched or []:
-        ingest(app, st, fields, edited=False, compact=False)
-    if fetched:
-        log.info("Đã bù %d tin của chat %s", len(fetched), st.storage.chat_label(chat_id))
-    return len(fetched or [])
+    label = st.storage.chat_label(chat_id)
+    with timed(log, "đồng bộ tin nhắn của chat %s (lấy từ Telegram)", label):
+        fetched = await ub.fetch_since(chat_id, since)
+    if fetched is None:
+        return 0  # chủ bot không đọc được chat này (userbot đã ghi cảnh báo)
+    if last is None:
+        # Lần đồng bộ đầu: từ ngày này trở đi bot có đủ tin nhắn của chat (coverage.data_from khi hỏi đáp)
+        st.storage.set_data_from(chat_id, since.date().isoformat())
+    added = sum(ingest(app, st, fields, edited=False, process=False) for fields in fetched)
+    st.synced.add(chat_id)
+    if added:
+        log.info("Đồng bộ tin nhắn: đã lưu %d tin mới của chat %s", added, label)
+    else:
+        log.info("Đồng bộ tin nhắn: không có tin mới của chat %s", label)
+    return added
 
 
-async def supplement_tracked(app, st) -> None:
-    """Bù tin cho mọi chat đang theo dõi. Lấy từ tin cuối gửi trước lúc userbot khởi động: tin userbot
-    nhận trực tiếp sau đó không làm bỏ sót các tin gửi lúc bot tắt."""
+async def sync_tracked_chats(app, st) -> None:
+    """Đồng bộ tin nhắn cho mọi chat đang theo dõi. Lấy từ tin cuối gửi trước lúc userbot khởi động: tin
+    userbot nhận trực tiếp sau đó không làm bỏ sót các tin gửi lúc bot tắt."""
     ub = active_userbot(st)
     if ub is None:
         return
     for chat_id in st.storage.tracked_chats():
         try:
-            await supplement_chat(app, st, chat_id, before=ub.started_at)
+            await sync_chat(app, st, chat_id, before=ub.started_at)
         except Exception:
-            log.exception("Bù tin chat %s thất bại", st.storage.chat_label(chat_id))
+            log.exception("Đồng bộ tin nhắn của chat %s thất bại", st.storage.chat_label(chat_id))
 
 
-def start_supplement(app, st, chat_id: int) -> None:
-    """Chat vừa được theo dõi: bù tin nền (lịch sử USERBOT_HISTORY_DAYS ngày)."""
+def start_sync(app, st, chat_id: int) -> None:
+    """Chat vừa được theo dõi: đồng bộ tin nhắn chạy nền (lấy USERBOT_HISTORY_DAYS ngày gần nhất)."""
     if active_userbot(st) is not None:
-        app.create_task(supplement_chat(app, st, chat_id, before=datetime.now(st.config.timezone)))
+        app.create_task(sync_chat(app, st, chat_id, before=datetime.now(st.config.timezone)))
 
 
 async def remember_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -219,7 +266,7 @@ async def remember_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if chat and chat.type in GROUP_CHAT_TYPES and chat.title:
         st = state_of(context)
         if track_chat(st, chat.id, chat.title, getattr(chat, "username", None)):
-            start_supplement(context.application, st, chat.id)
+            start_sync(context.application, st, chat.id)
 
 
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -320,16 +367,22 @@ def route_mention(question: str) -> tuple[str, str]:
     return "help", ""
 
 
+MENTION_KINDS = {"summary": "<summarize>", "tasks": "<task>", "ask": "hỏi đáp", "help": "hướng dẫn"}
+
+
 async def handle_mention(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str) -> None:
     kind, arg = route_mention(question)
-    if kind == "summary":
-        await do_summary(update, context, arg or state_of(context).today())
-    elif kind == "tasks":
-        await do_tasks(update, context, arg)
-    elif kind == "ask":
-        await answer_question(update, context, question)
-    else:
-        await update.effective_message.reply_text(mention_help(context.bot.username))
+    label = state_of(context).storage.chat_label(update.effective_chat.id)
+    # Tổng thời gian từ lúc nhận yêu cầu tới lúc gửi xong câu trả lời
+    with timed(log, "yêu cầu @bot %s trong chat %s (tổng)", MENTION_KINDS[kind], label):
+        if kind == "summary":
+            await do_summary(update, context, arg or state_of(context).today())
+        elif kind == "tasks":
+            await do_tasks(update, context, arg)
+        elif kind == "ask":
+            await answer_question(update, context, question)
+        else:
+            await update.effective_message.reply_text(mention_help(context.bot.username))
 
 
 def mentions_bot(msg, bot) -> bool:
@@ -359,14 +412,16 @@ async def answer_question(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
     await context.bot.send_chat_action(chat.id, "typing")
     proposals = []
     try:
-        can_edit = await can_edit_tasks(context, chat.id, msg.from_user.id)
+        with timed(log, "kiểm tra quyền sửa task (Telegram)"):
+            can_edit = await can_edit_tasks(context, chat.id, msg.from_user.id)
         reply, proposals = await st.qa.answer(
             chat.id, chat.title or "", st.today(), msg.from_user.full_name, question, can_edit
         )
     except Exception:
         log.exception("Trả lời thất bại")
         reply = "Xin lỗi, mình đang gặp lỗi khi tra cứu. Bạn thử lại sau nhé."
-    await send_answer(st, msg, chat.id, msg.from_user.id, reply, proposals)
+    with timed(log, "gửi câu trả lời (Telegram)"):
+        await send_answer(st, msg, chat.id, msg.from_user.id, reply, proposals)
 
 
 async def send_answer(
@@ -424,21 +479,37 @@ async def on_edit_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat_id, today = edit["chat_id"], st.today()
     try:
         async with st.locks[chat_id]:
-            await asyncio.to_thread(
-                lambda: apply_edit(
-                    st.storage, st.sheets.worksheet_for(chat_id), chat_id, edit["stt"], edit["changes"], today
-                )
-            )
+            await asyncio.to_thread(apply_confirmed_edit, st, chat_id, edit["stt"], edit["changes"], today)
     except Exception as e:
         log.exception("Sửa task thất bại")
         st.sheets.forget(chat_id)
         await query.answer()
         await query.edit_message_text(query.message.text + f"\n\nLỗi khi ghi sheet: {e}")
         return
+    # Ghi lại thay đổi vào lịch sử chat của hôm nay: đi vào bản tóm tắt ngày, và pha A biết sheet đã đổi
+    st.storage.add_note(chat_id, edit_note(query.from_user.full_name, edit), datetime.now(st.config.timezone))
     await query.answer("Đã cập nhật")
     await query.edit_message_text(
         query.message.text.replace("Xác nhận sửa", "Đã sửa", 1) + f"\n\nNgười xác nhận: {query.from_user.full_name}"
     )
+
+
+def apply_confirmed_edit(st, chat_id: int, stt: int, changes: dict, today: str) -> None:
+    """Ghi thay đổi người dùng đã xác nhận (lời gọi chặn, chạy trong thread). Đây là thay đổi do bot ghi, nên
+    cập nhật dấu vân tay rà soát: lần khởi động sau không phải rà lại sheet vì thay đổi này."""
+    sheet = TaskSheet(st.sheets.worksheet_for(chat_id), st.storage, chat_id)
+    before = sheet.rows()
+    sheet.update(stt, changes, today)
+    refresh_after_bot_write(st.storage, chat_id, before, sheet.rows())
+
+
+def edit_note(confirmer: str, edit: dict) -> str:
+    """Ghi chú lưu vào lịch sử chat khi sửa task theo xác nhận, ví dụ
+    "An xác nhận sửa task #1 (Báo cáo Q3): Deadline: 2026-10-30 → 2026-11-10"."""
+    changes = "; ".join(
+        f"{FIELD_LABELS[f]}: {edit['current'].get(f) or '(trống)'} → {v}" for f, v in edit["changes"].items()
+    )
+    return f"{confirmer} xác nhận sửa task #{edit['stt']} ({edit['current'].get('name', '')}): {changes}"
 
 
 def format_task(t: dict) -> str:
@@ -503,9 +574,9 @@ async def do_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, day: st
     st = state_of(context)
     chat_id = update.effective_chat.id
     # Với hôm nay, xử lý hết các tin nhắn mới (kể cả tin vừa gửi) để task lên sheet và tóm tắt đầy đủ
-    # ngay. Không chờ thử lại để người gọi không phải đợi; lỗi thì lần chốt sau xử lý.
+    # ngay. Không chờ thử lại để người gọi không phải đợi; lỗi thì lần chốt ngày sau xử lý.
     if day == st.today():
-        await st.compact(chat_id, day, finalize=False, retry=False, keep_recent=False)
+        await st.process(chat_id, day, finalize=False, retry=False, keep_recent=False)
     try:
         tasks = [
             t for t in (await asyncio.to_thread(st.task_sheet, chat_id)).rows()
@@ -567,7 +638,8 @@ class Session:
     kind: str  # "user" | "group"
     option: tuple  # (chat_id, tên, username)
     last_active: datetime
-    history: list[tuple[str, str]] = field(default_factory=list)
+    # (câu hỏi, câu trả lời, ngày hỏi YYYY-MM-DD): ngày hỏi được ghi ở đầu câu hỏi khi gửi lại cho model
+    history: list[tuple[str, str, str]] = field(default_factory=list)
     # Câu hỏi gửi liên tiếp được trả lời lần lượt, lượt sau thấy lượt trước
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -633,7 +705,8 @@ async def cmd_p(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     ref, request = parse_target_argument(command_argument(msg.text or ""))
     try:
-        options = await ub.find_users(ref) if ref else await ub.recent_users()
+        with timed(log, "tìm người dùng cho /p (Telegram)"):
+            options = await ub.find_users(ref) if ref else await ub.recent_users()
     except Exception:
         log.exception("Tìm người dùng thất bại")
         options = []
@@ -658,13 +731,14 @@ async def cmd_g(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     ref, request = parse_target_argument(command_argument(msg.text or ""))
     try:
-        if ref:
-            options = await ub.find_groups(ref)
-        else:
-            # Nhóm đang theo dõi trước, rồi các nhóm gần đây khác
-            options = list(st.storage.tracked_groups())
-            seen = {o[0] for o in options}
-            options += [o for o in await ub.recent_groups() if o[0] not in seen]
+        with timed(log, "tìm nhóm cho /g (Telegram)"):
+            if ref:
+                options = await ub.find_groups(ref)
+            else:
+                # Nhóm đang theo dõi trước, rồi các nhóm gần đây khác
+                options = list(st.storage.tracked_groups())
+                seen = {o[0] for o in options}
+                options += [o for o in await ub.recent_groups() if o[0] not in seen]
     except Exception:
         log.exception("Tìm nhóm thất bại")
         options = []
@@ -737,7 +811,8 @@ async def start_session(context, msg, kind: str, option: tuple, request: str | N
     async with session.lock:
         await context.bot.send_chat_action(msg.chat_id, "typing")
         try:
-            await prepare_chat(context, option)
+            with timed(log, "chuẩn bị dữ liệu khi mở chủ đề về chat %s (tổng)", option[1]):
+                await prepare_chat(context, option)
         except Exception:
             log.exception("Chuẩn bị dữ liệu chat %s thất bại", st.storage.chat_label(option[0]))
     # Sau prepare_chat: tên / username của chat đã được lưu nên nhãn trong log đầy đủ
@@ -749,17 +824,24 @@ async def start_session(context, msg, kind: str, option: tuple, request: str | N
 
 
 async def prepare_chat(context, option: tuple) -> None:
-    """Theo dõi chat, bù tin, xử lý mọi ngày còn tin chưa xử lý (ghi task lên sheet, tóm tắt), để câu hỏi
-    trong chủ đề có dữ liệu đầy đủ ngay từ đầu."""
+    """Theo dõi chat, đồng bộ tin nhắn, rồi xử lý tin nhắn của mọi ngày còn tin chưa xử lý (ghi task lên
+    sheet, tóm tắt), để câu hỏi trong chủ đề có dữ liệu đầy đủ ngay từ đầu."""
     st = state_of(context)
     chat_id, name, username = option
     before = datetime.now(st.config.timezone)
     track_chat(st, chat_id, name, username)
-    await supplement_chat(context.application, st, chat_id, before=before)
+    if chat_id in st.synced:
+        # Đã đồng bộ trong lần chạy này (lúc khởi động hoặc lần mở chủ đề trước) và userbot đang nhận trực tiếp
+        # tin mới của chat: không còn tin nào cần lấy, bỏ qua để mở chủ đề nhanh hơn
+        log.info("Mở chủ đề: chat %s đã đồng bộ tin nhắn, bỏ qua bước đồng bộ", st.storage.chat_label(chat_id))
+    else:
+        await sync_chat(context.application, st, chat_id, before=before)
     today = st.today()
-    for day in st.storage.pending_days(chat_id):
-        if (chat_id, day) not in st.busy:
-            await st.compact(chat_id, day, finalize=day < today, retry=False, keep_recent=False)
+    days = [d for d in st.storage.pending_days(chat_id) if (chat_id, d) not in st.busy]
+    # Mỗi ngày là một lượt xử lý (≥ 2 lần gọi LLM): mở chủ đề với nhiều ngày chưa xử lý thì lâu
+    log.info("Mở chủ đề: %d ngày còn tin chưa xử lý của chat %s", len(days), st.storage.chat_label(chat_id))
+    for day in days:
+        await st.process(chat_id, day, finalize=day < today, retry=False, keep_recent=False)
 
 
 async def on_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -794,25 +876,34 @@ async def ask_in_session(context, msg, session: Session, request: str) -> None:
     st = state_of(context)
     ub = active_userbot(st)
     chat_id = session.option[0]
-    async with session.lock:
+    label = st.storage.chat_label(chat_id)
+    # Chờ lâu ở đây = câu hỏi trước (hoặc phần chuẩn bị dữ liệu khi mở chủ đề) chưa xong
+    with timed(log, "chờ câu hỏi trước trong chủ đề về chat %s", label):
+        await session.lock.acquire()
+    try:
         session.last_active = datetime.now(timezone.utc)
         await context.bot.send_chat_action(msg.chat_id, "typing")
         proposals = []
+        today = st.today()
         try:
-            reply, proposals = await st.qa.answer(
-                chat_id, session.title, st.today(), ub.owner_name, request, can_edit=True,
-                history=session.history[-MAX_SESSION_TURNS:],
-            )
+            with timed(log, "câu hỏi trong chủ đề về chat %s (tổng, kèm %d lượt trước)", label, len(session.history)):
+                reply, proposals = await st.qa.answer(
+                    chat_id, session.title, today, ub.owner_name, request, can_edit=True,
+                    history=session.history[-MAX_SESSION_TURNS:],
+                )
         except Exception:
             log.exception("Trả lời trong chủ đề về chat %s thất bại", st.storage.chat_label(chat_id))
             reply = "Xin lỗi, mình đang gặp lỗi khi xử lý yêu cầu. Bạn thử lại sau nhé."
         else:
             # Chủ đề đã bị /e hoặc bị thay trong lúc trả lời: không ghi vào chủ đề đã bỏ
             if st.session is session and reply:
-                session.history.append((request, reply))
+                session.history.append((request, reply, today))
                 del session.history[:-MAX_SESSION_TURNS]
                 session.last_active = datetime.now(timezone.utc)
-        await send_answer(st, msg, chat_id, ub.owner_id, reply, proposals, footer=SESSION_FOOTER)
+        with timed(log, "gửi câu trả lời (Telegram)"):
+            await send_answer(st, msg, chat_id, ub.owner_id, reply, proposals, footer=SESSION_FOOTER)
+    finally:
+        session.lock.release()
 
 
 # ---- lịch chạy ----
@@ -821,35 +912,41 @@ async def finalize_past_days(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Chốt mọi ngày trước hôm nay chưa được chốt: ghi task lên sheet + tóm tắt.
 
     Chạy lúc DAILY_SUMMARY_TIME (mặc định 00:01) và một lần khi khởi động. Ngày hôm qua luôn được
-    chốt, kể cả khi trong ngày đã có <summarize> hay đã nén vì vượt ngưỡng; ngày có tin bị sửa sau khi
-    chốt cũng được mở lại và chốt lại ở đây.
+    chốt, kể cả khi trong ngày đã có <summarize> hay đã xử lý giữa ngày vì vượt ngưỡng; ngày có tin bị sửa
+    sau khi chốt cũng được mở lại và chốt lại ở đây.
     """
     st = state_of(context)
-    for chat_id, day in st.storage.unfinalized_days_before(st.today()):
-        if (chat_id, day) not in st.busy:
-            await st.compact(chat_id, day, finalize=True)
+    with timed(log, "chốt các ngày còn dở (tổng)"):
+        for chat_id, day in st.storage.unfinalized_days_before(st.today()):
+            if (chat_id, day) not in st.busy:
+                await st.process(chat_id, day, finalize=True)
 
 
-# Chờ Telegram gửi bù các cập nhật lúc bot tắt rồi mới xử lý, để không bỏ sót chúng
+# Chờ Telegram gửi lại các cập nhật nhận được lúc bot tắt rồi mới xử lý, để không bỏ sót chúng
 STARTUP_DELAY_SECONDS = 10
 
 
 async def on_startup(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Chạy một lần sau khi khởi động:
-    0. Userbot bù tin gửi lúc bot tắt cho mọi chat đang theo dõi.
-    1. Chốt bù các ngày trước hôm nay còn dở.
+    """Chạy một lần sau khi khởi động. Các bước giữ khoá của từng chat, nên trong lúc này <summarize> và mở
+    chủ đề có thể phải chờ.
+    0. Đồng bộ tin nhắn (tin gửi lúc bot tắt) cho mọi chat đang theo dõi.
+    1. Chốt các ngày trước hôm nay còn dở.
     2. Xử lý hết tin nhắn chưa xử lý của hôm nay (như <summarize>, nhưng không chốt ngày).
     3. Rà soát sheet của từng chat (xem bot/review.py). Sheet không đổi từ lần rà trước thì bỏ qua.
     """
     st = state_of(context)
-    await supplement_tracked(context.application, st)
-    await finalize_past_days(context)
-    today = st.today()
-    for chat_id in st.storage.chats_with_messages_on(today):
-        if (chat_id, today) not in st.busy and pending_chars(st.storage, chat_id, today) > 0:
-            await st.compact(chat_id, today, finalize=False, keep_recent=False)
-    for chat_id in st.storage.chats_with_tasks():
-        await st.review(chat_id)
+    with timed(log, "việc khi khởi động (tổng)"):
+        with timed(log, "khởi động - đồng bộ tin nhắn mọi chat"):
+            await sync_tracked_chats(context.application, st)
+        await finalize_past_days(context)
+        today = st.today()
+        with timed(log, "khởi động - xử lý tin nhắn hôm nay"):
+            for chat_id in st.storage.chats_with_messages_on(today):
+                if (chat_id, today) not in st.busy and pending_chars(st.storage, chat_id, today) > 0:
+                    await st.process(chat_id, today, finalize=False, keep_recent=False)
+        with timed(log, "khởi động - rà soát sheet"):
+            for chat_id in st.storage.chats_with_tasks():
+                await st.review(chat_id)
 
 
 # Menu lệnh chỉ hiện trong chat riêng của chủ bot; trong nhóm không gợi ý lệnh nào
@@ -966,7 +1063,7 @@ def build_application(config: Config) -> Application:
     always_run = {"misfire_grace_time": None}
     hh, mm = map(int, config.daily_summary_time.split(":"))
     app.job_queue.run_daily(finalize_past_days, time(hh, mm, tzinfo=config.timezone), job_kwargs=always_run)
-    # Khi khởi động: bù tin, chốt bù các ngày còn dở (ví dụ bot bị tắt lúc 00:01) và xử lý tin hôm nay
+    # Khi khởi động: đồng bộ tin nhắn, chốt các ngày còn dở (ví dụ bot bị tắt lúc 00:01), xử lý tin hôm nay
     app.job_queue.run_once(on_startup, STARTUP_DELAY_SECONDS, job_kwargs=always_run)
     return app
 

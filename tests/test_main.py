@@ -26,17 +26,17 @@ def test_startup_finalizes_past_days_and_processes_today_pending():
     s.record_task(-2, 1, "2026-10-29", created=True)  # nhóm -2 có task trên sheet
     calls = []
 
-    async def compact(chat_id, day, finalize, retry=True, keep_recent=True):
+    async def process(chat_id, day, finalize, retry=True, keep_recent=True):
         calls.append((chat_id, day, finalize, keep_recent))
 
     async def review(chat_id):
         calls.append(("review", chat_id))
 
-    st = SimpleNamespace(storage=s, busy=set(), today=lambda: "2026-10-29", compact=compact, review=review, userbot=None)
+    st = SimpleNamespace(storage=s, busy=set(), today=lambda: "2026-10-29", process=process, review=review, userbot=None)
     context = SimpleNamespace(application=SimpleNamespace(bot_data={"state": st}))
     asyncio.run(on_startup(context))
     assert calls == [
-        (-1, "2026-10-28", True, True),    # chốt bù hôm qua
+        (-1, "2026-10-28", True, True),    # chốt ngày hôm qua (còn dở)
         (-1, "2026-10-29", False, False),  # xử lý hết tin hôm nay, không chốt ngày
         ("review", -2),                    # rà soát sheet các nhóm có task
     ]
@@ -159,7 +159,7 @@ def make_state(userbot=None):
         storage=Storage(":memory:"), started_at=datetime(2026, 10, 29, 2, tzinfo=timezone.utc),
         config=SimpleNamespace(timezone=ZoneInfo("Asia/Ho_Chi_Minh"), compact_threshold_chars=60000,
                                userbot_history_days=7),
-        busy=set(), today=lambda: "2026-10-29", userbot=userbot, pending_edits={}, pending_picks={}, session=None,
+        busy=set(), today=lambda: "2026-10-29", userbot=userbot, pending_edits={}, pending_picks={}, session=None, synced=set(),
     )
 
 
@@ -284,3 +284,47 @@ def test_remember_chat_records_group_title_and_tracks_it():
     send(None)  # cập nhật không gắn với chat nào
     assert st.storage.chat_title(5) is None
     assert st.storage.conn.execute("select count(*) from chats").fetchone()[0] == 1
+
+
+def test_confirmed_edit_writes_sheet_adds_note_and_keeps_sheet_reviewed():
+    import asyncio
+    from collections import defaultdict
+
+    import bot.main as m
+    from bot.review import fingerprint
+    from bot.sheets import TaskSheet
+    from bot.storage import BOT_NOTE_NAME
+    from tests.test_sheets import DEADLINE, task
+
+    tz = ZoneInfo("Asia/Ho_Chi_Minh")
+    s, ws = Storage(":memory:"), FakeWorksheet()
+    TaskSheet(ws, s, -1).add(task("Báo cáo Q3", assignee="Lan", deadline="2026-10-30"), "2026-10-27")
+    s.add_message(-1, 7, 1, "An", "giao Lan báo cáo", None, datetime(2026, 10, 27, 9, tzinfo=tz))
+    s.save_review(-1, fingerprint(TaskSheet(ws, s, -1).rows()))  # sheet đã rà soát
+    st = SimpleNamespace(
+        storage=s, sheets=SimpleNamespace(worksheet_for=lambda chat_id: ws, forget=lambda chat_id: None),
+        locks=defaultdict(asyncio.Lock), today=lambda: "2026-11-06", config=SimpleNamespace(timezone=tz),
+        pending_edits={"e1": {"chat_id": -1, "user_id": 5, "stt": 1, "changes": {"deadline": "2026-11-10"},
+                              "current": {"name": "Báo cáo Q3", "deadline": "2026-10-30"}}},
+    )
+    answers, edits = [], []
+
+    async def answer(text=None, show_alert=False):
+        answers.append(text)
+
+    async def edit_message_text(text):
+        edits.append(text)
+
+    query = SimpleNamespace(data="edit:e1:ok", from_user=SimpleNamespace(id=5, full_name="An"),
+                            message=SimpleNamespace(text="Xác nhận sửa task #1"), answer=answer,
+                            edit_message_text=edit_message_text)
+    context = SimpleNamespace(application=SimpleNamespace(bot_data={"state": st}))
+    asyncio.run(m.on_edit_button(SimpleNamespace(callback_query=query), context))
+
+    assert ws.rows[1][DEADLINE] == "2026-11-10" and answers == ["Đã cập nhật"]
+    # Thay đổi được ghi vào lịch sử chat (id âm, người gửi là bot) để đi vào bản tóm tắt ngày
+    (note,) = [r for r in s.conn.execute("select message_id, user_name, text from messages where message_id < 0")]
+    assert note["message_id"] == -1 and note["user_name"] == BOT_NOTE_NAME
+    assert note["text"] == "An xác nhận sửa task #1 (Báo cáo Q3): Deadline: 2026-10-30 → 2026-11-10"
+    # Thay đổi do bot ghi: sheet vẫn ở trạng thái đã rà, lần khởi động sau không rà lại
+    assert s.review_fingerprint(-1) == fingerprint(TaskSheet(ws, s, -1).rows())

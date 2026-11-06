@@ -10,8 +10,9 @@ Bot API chỉ cho bot thấy tin của nhóm có bot, tính từ lúc bot vào: 
 cũ, hay tin gửi lúc bot tắt quá 24 giờ. Vì vậy việc được chia làm hai:
 
 - **Userbot**: tài khoản Telegram của **chủ bot** (thư viện Telethon), chạy chung tiến trình với bot.
-  Đây là **nguồn tin duy nhất**: theo dõi liên tục tin mới / tin sửa, và bù tin khi khởi động hoặc khi
-  chủ bot gửi yêu cầu riêng. Userbot chỉ thu tin của các chat **đang theo dõi**: nhóm có bot, cộng với
+  Đây là **nguồn tin duy nhất**: theo dõi liên tục tin mới / tin sửa, và **đồng bộ tin nhắn** (lấy từ
+  Telegram những tin chưa có trong DB) khi khởi động, khi bắt đầu theo dõi một chat, hoặc khi chủ bot mở
+  chủ đề. Userbot chỉ thu tin của các chat **đang theo dõi**: nhóm có bot, cộng với
   chat chủ bot đã mở chủ đề bằng `/p` / `/g`.
 - **Bot BotFather**: chỉ nhận yêu cầu và trả lời, không tự lưu tin hội thoại.
 
@@ -119,7 +120,9 @@ Bạn: /e
 Bot: Đã kết thúc chủ đề: Chat riêng với Lan.
 ```
 
-Khi mở chủ đề, bot đánh dấu theo dõi chat đó, bù tin (lần đầu lấy `USERBOT_HISTORY_DAYS` ngày, mặc định 7)
+Khi mở chủ đề, bot đánh dấu theo dõi chat đó, đồng bộ tin nhắn nếu chat chưa được đồng bộ trong lần chạy này
+(lần đầu lấy `USERBOT_HISTORY_DAYS` ngày, mặc định 7; chat đã đồng bộ lúc khởi động hay lần mở chủ đề trước thì
+bỏ qua, vì userbot đã nhận trực tiếp mọi tin mới của chat)
 và xử lý mọi ngày còn tin chưa xử lý (ghi task lên sheet, tóm tắt; ngày trước hôm nay được chốt). Các câu
 hỏi sau trong chủ đề không xử lý lại: tin mới userbot nhận trực tiếp, và hỏi đáp đọc được cả tin chưa xử
 lý. Chủ bot có quyền sửa task (nút Xác nhận hiện trong chat riêng). Chat riêng được xử lý như một nhóm:
@@ -132,7 +135,7 @@ task ghi vào **tab riêng mang tên người kia**.
 ```
 Tin tag @bot (bot nhận) ───> <summarize> / <task> / hỏi đáp, không lưu
                              (gửi lúc bot tắt → reply "tạm ngừng, hãy hỏi lại")
-/p, /g (chat riêng của chủ bot) ─> chọn chat (nút) ─> mở chủ đề: bù tin, xử lý
+/p, /g (chat riêng của chủ bot) ─> chọn chat (nút) ─> mở chủ đề: đồng bộ tin nhắn, xử lý tin nhắn
 Tin thường của chủ bot (chat riêng) ─> câu hỏi của chủ đề (kèm các lượt trước) ─> trả lời + dòng "/e"
 
 Tin nhắn thường của chat đang theo dõi (userbot nhận; chế độ dự phòng: bot nhận)
@@ -162,20 +165,20 @@ Tin nhắn thường của chat đang theo dõi (userbot nhận; chế độ d�
   `COMPACT_RETRY_DELAY_SECONDS` giây, nhân đôi mỗi lần). Nếu vẫn lỗi, lần chốt sau xử lý lại. Thử lại
   sau khi đã ghi một phần không tạo task trùng (model đọc lại sheet).
 - **Chốt ngày lúc 00:01:** mọi ngày trước hôm nay chưa chốt đều được xử lý nốt và đánh dấu đã chốt,
-  kể cả khi trong ngày đã chạy `<summarize>` hay đã nén vì vượt ngưỡng.
+  kể cả khi trong ngày đã chạy `<summarize>` hay đã xử lý giữa ngày vì vượt ngưỡng.
 - **Tin nhắn bị sửa** được cập nhật và đưa lại vào lần xử lý tới (ngày đã chốt được mở lại và chốt
   lại lúc 00:01 hôm sau). Tin sửa chỉ đổi thứ khác nội dung (ví dụ reaction) thì bỏ qua. Tin lệnh /
   tin tag bot chỉ có hiệu lực lần gửi đầu: sửa lại thì bot bỏ qua.
-- **Lúc bot tắt:** khi chạy lại, userbot bù mọi tin gửi lúc bot tắt (không giới hạn 24 giờ), lấy từ
+- **Lúc bot tắt:** khi chạy lại, userbot đồng bộ mọi tin gửi lúc bot tắt (không giới hạn 24 giờ), lấy từ
   tin cuối đã lưu của từng chat đang theo dõi. Lệnh riêng và tin tag bot gửi lúc bot tắt không được
   thực hiện muộn, bot chỉ báo là lúc đó đang tạm ngừng và nhờ hỏi / gõ lại.
 
 ### Khi khởi động
 
 Userbot đăng nhập ngay khi bot kết nối Telegram. Sau khoảng 10 giây, bot lần lượt:
-0. Userbot bù tin cho mọi chat đang theo dõi: từ tin cuối đã lưu gửi trước lúc userbot khởi động
+0. Userbot đồng bộ tin nhắn cho mọi chat đang theo dõi: từ tin cuối đã lưu gửi trước lúc userbot khởi động
    (chat chưa có tin: `USERBOT_HISTORY_DAYS` ngày gần nhất).
-1. Chốt bù các ngày trước hôm nay còn dở.
+1. Chốt các ngày trước hôm nay còn dở.
 2. Xử lý hết tin chưa xử lý của hôm nay (như `<summarize>`, không chốt ngày).
 3. **Rà soát sheet** của từng nhóm:
    - dòng nhập tay chưa có STT → gán STT kế tiếp;
@@ -189,12 +192,37 @@ Userbot đăng nhập ngay khi bot kết nối Telegram. Sau khoảng 10 giây, 
    Sheet và quy tắc rà soát không đổi kể từ lần rà trước thì bỏ qua (không gọi LLM). Bot không bao
    giờ xoá dòng.
 
-### Quy đổi deadline
+   "Không đổi" được kiểm tra bằng **dấu vân tay** (bảng `sheet_reviews`): mã băm nội dung mọi dòng task
+   (STT, tên, người thực hiện, nội dung, tiến độ, deadline) cộng prompt rà soát và quy tắc deadline, lưu sau
+   mỗi lần rà. Khi **chính bot ghi sheet** (xử lý tin nhắn, người dùng bấm Xác nhận sửa task) mà ngay trước đó
+   sheet đang ở trạng thái đã rà, dấu vân tay được cập nhật theo. Vì vậy lần khởi động sau chỉ rà lại khi có
+   **người sửa tay** trên sheet, hoặc khi prompt / quy tắc rà soát đổi.
 
-Deadline luôn ghi dạng YYYY-MM-DD. Code (`bot/dates.py`) tính sẵn bảng lịch của ngày mốc (tuần này
-và 2 tuần tới, ngày cuối tháng) đưa vào prompt, model chỉ tra bảng, không tự nhẩm thứ. Ngày mốc là
-ngày gửi tin khi ghi task, ngày giao task khi rà soát, hôm nay khi hỏi đáp. Tuần tính từ thứ Hai đến
-Chủ nhật:
+**Bảo vệ thay đổi trên sheet khi xử lý lại tin cũ.** Pha A (ghi task từ tin nhắn của ngày D) bị code chặn:
+- không sửa dòng đã đánh dấu (`Tất cả` / `Trùng với task #N`);
+- không sửa task có ngày cập nhật **sau** ngày D, vì tin nhắn cũ hơn thay đổi đó. Ví dụ: tin ngày 29/10 nói
+  "deadline 30/10", ngày 5/11 người dùng xác nhận dời sang 10/11; khi ngày 29/10 bị xử lý lại (có tin sửa
+  muộn), deadline vẫn giữ 10/11.
+
+**Thay đổi do người dùng xác nhận được ghi vào lịch sử chat.** Bấm Xác nhận sửa task thì ngoài việc ghi
+sheet, bot lưu một ghi chú vào tin nhắn của hôm nay, người gửi `Bot (ghi chú)`, ví dụ
+`An xác nhận sửa task #1 (Báo cáo Q3): Deadline: 2026-10-30 → 2026-11-10`. Ghi chú đi vào bản tóm tắt ngày
+như một thay đổi đã thực hiện (hỏi "tuần này có gì thay đổi" sẽ thấy); pha A biết đây không phải giao việc
+mới. Sửa tay trực tiếp trên sheet thì không có ghi chú (bot không biết ai sửa, sửa lúc nào).
+
+### Quy đổi ngày (deadline và câu hỏi về quá khứ)
+
+Ngày luôn ghi dạng YYYY-MM-DD. Code (`bot/dates.py`) tính sẵn bảng lịch của ngày mốc đưa vào prompt:
+ngày từng thứ của 2 tuần trước, tuần này và 2 tuần sau, dải ngày tháng trước / tháng này, ngày cuối tháng
+này / tháng sau. Model chỉ tra bảng, không tự nhẩm thứ. Ngày mốc là ngày gửi tin khi ghi task, ngày giao task
+khi rà soát, ngày hỏi khi hỏi đáp. Tuần tính từ thứ Hai đến Chủ nhật.
+
+Khi hỏi đáp, mỗi câu hỏi gửi model có ngày hỏi ở đầu, ví dụ `[Thứ 6, 06/11/2026] An hỏi: ...` (câu hỏi cũ
+trong chủ đề giữ ngày hỏi của nó). Quy tắc và bảng lịch chỉ giúp model tra đúng, code không ép được model
+chọn đúng dòng; nhưng công cụ nhận ngày sai dạng hoặc không có thật (`27/10`, `tuần trước`, `2026-02-30`)
+thì báo lỗi rõ ràng để model gọi lại, thay vì âm thầm trả kết quả rỗng.
+
+Cụm chỉ deadline (tương lai):
 
 | Cụm trong chat | Deadline |
 |---|---|
@@ -205,6 +233,19 @@ Chủ nhật:
 | cuối tuần / cuối tuần sau | Chủ nhật tuần này / tuần sau |
 | cuối tháng / cuối tháng sau | ngày cuối cùng của tháng này / tháng sau |
 | cụm không chỉ được ngày nào ("sớm", "khi nào xong") | ghi nguyên văn |
+
+Cụm chỉ thời gian đã qua (trong câu hỏi):
+
+| Cụm trong câu hỏi | Ngày / khoảng ngày |
+|---|---|
+| hôm qua / hôm kia | ngày mốc - 1 / - 2 |
+| thứ N tuần trước / tuần trước nữa | thứ N của tuần trước / tuần trước nữa |
+| tuần trước | thứ Hai → Chủ nhật tuần trước |
+| tuần này | thứ Hai tuần này → ngày mốc |
+| tháng trước | ngày 1 → ngày cuối tháng trước |
+| tháng này | ngày 1 → ngày mốc |
+| đầu / cuối tháng trước | ngày 1 → 10 / ngày 21 → ngày cuối của tháng trước |
+| tháng N (không nói năm) | tháng N gần nhất không sau ngày mốc |
 
 ## Cấu trúc lưu trữ
 
@@ -240,10 +281,10 @@ Spreadsheet
 | Bảng | Khoá | Nội dung |
 |---|---|---|
 | `chats` | `chat_id` | Tên chat gần nhất (dùng đặt tên tab), `username` (nhóm công khai / người kia trong chat riêng, để log dễ đọc), `tracked` (userbot theo dõi chat này: nhóm có bot, chat đã gọi lệnh riêng; bot bị xoá khỏi nhóm thì `0`) |
-| `messages` | `id` tự tăng; `(chat_id, message_id)` duy nhất | Từng tin nhắn gốc: người gửi, nội dung, tin được reply, `sent_at`, `day`, `edit_pending` (tin đã xử lý nhưng bị sửa, cần xử lý lại) |
+| `messages` | `id` tự tăng; `(chat_id, message_id)` duy nhất | Từng tin nhắn gốc: người gửi, nội dung, tin được reply, `sent_at`, `day`, `edit_pending` (tin đã xử lý nhưng bị sửa, cần xử lý lại). Ghi chú của bot (sửa task theo xác nhận) cũng nằm ở đây: `message_id` âm, người gửi `Bot (ghi chú)` |
 | `day_summaries` | `(chat_id, day)` | Bản tóm tắt của ngày, `compacted_until` (id tin cuối đã xử lý), `finalized` (ngày đã chốt). Cột `tasks_json` của phiên bản cũ không còn dùng |
 | `task_meta` | `(chat_id, stt)` | `created_day` (ngày giao), `updated_day` (ngày cập nhật gần nhất) của từng task trên sheet |
-| `sheet_reviews` | `chat_id` | Dấu vân tay sheet ở lần rà soát gần nhất (sheet không đổi thì không rà lại) |
+| `sheet_reviews` | `chat_id` | Dấu vân tay sheet ở lần rà soát gần nhất, cập nhật theo khi bot tự ghi sheet (chỉ sửa tay mới làm rà lại) |
 
 Database là file trên ổ đĩa: tắt / khởi động lại bot không mất gì. Khi chạy bằng Docker, nhớ gắn thư
 mục `data/` ra ngoài và sao lưu.
@@ -269,11 +310,32 @@ mục `data/` ra ngoài và sao lưu.
 
 ### Hỏi đáp tra cứu những gì
 
-Với mỗi câu hỏi (tag bot, lệnh riêng), model tự gọi công cụ, chỉ trong phạm vi **chat đang hỏi**, tối đa 6 lượt gọi model:
-- `list_tasks`: task trên sheet, mặc định được giao hoặc cập nhật trong **30 ngày gần nhất** (model có
-  thể chọn khoảng ngày khác).
-- `get_day`: bản tóm tắt của **một ngày** + tối đa 200 tin **chưa xử lý** của ngày đó. Model luôn xem
-  hôm nay, cộng các ngày câu hỏi nhắc tới.
+Với mỗi câu hỏi (tag bot, câu hỏi trong chủ đề), dữ liệu chỉ lấy trong phạm vi **chat đang hỏi**:
+- **Nạp sẵn:** trước khi gọi model, bot đọc Google Sheet và DB, gửi kèm câu hỏi: **phạm vi dữ liệu tin
+  nhắn** của chat, kết quả `list_tasks` mặc định và `get_day` của hôm nay. Model hầu như luôn cần
+  những thứ này, nên đa số câu hỏi chỉ tốn **một lượt gọi model** (trước đây ít nhất hai: một lượt chỉ để
+  model xin dữ liệu).
+- **Phạm vi dữ liệu** (`coverage`) có hai mốc (cột cùng tên trong bảng `chats`, ghi một lần):
+  - `tracked_since`: ngày bot bắt đầu theo dõi chat (mở `/p` `/g`, bot được thêm vào nhóm).
+  - `data_from`: ngày bot có đủ tin nhắn từ đó, tức ngày lần đồng bộ đầu tiên bắt đầu lấy, sớm hơn
+    `tracked_since` `USERBOT_HISTORY_DAYS` ngày. Chat theo dõi từ trước khi có mốc này thì lấy ngày có tin đầu tiên.
+
+  Từ `data_from` trở đi, ngày không có tin là ngày **không ai nhắn**; trước mốc đó bot **không
+  biết**. Model dùng mốc này để không tra ngày bot không có dữ liệu, và nói rõ khi khoảng được hỏi bắt đầu
+  sớm hơn (ví dụ "chỉ có dữ liệu từ 29/10"). Hạn chế: nếu chat từng bị thôi theo dõi rồi theo dõi lại, khoảng
+  bị hở ở giữa trông giống những ngày không ai nhắn.
+- Model vẫn có công cụ, tối đa 6 lượt gọi model, khi cần dữ liệu khác:
+  - `list_tasks`: task trên sheet, mặc định được giao hoặc cập nhật trong **30 ngày gần nhất** (model có
+    thể chọn khoảng ngày khác).
+  - `get_period`: bản tóm tắt của **mọi ngày có tin** trong một khoảng ngày (tối đa 91 ngày), kèm số tin và
+    số tin chưa xử lý của từng ngày. Dùng cho câu hỏi về tuần / tháng: "tóm tắt tháng 10" chỉ cần **một
+    lời gọi**, tổng cộng 2 lượt gọi model. Ngày không có tin bị bỏ qua; không có tin nguyên văn, để kết quả
+    gọn.
+  - `get_day`: bản tóm tắt của **một ngày** + tối đa 200 tin **chưa xử lý** của ngày đó, khi cần chi tiết
+    của một ngày cụ thể.
+  - `propose_task_edit` (người có quyền sửa task).
+- Tham số ngày của công cụ phải dạng `YYYY-MM-DD` và là ngày có thật; sai thì công cụ trả lỗi để model gọi lại.
+- Trong một lần trả lời, Google Sheet chỉ được đọc một lần (phần nạp sẵn và các công cụ dùng chung).
 
 Tin nhắn đã xử lý chỉ còn được tra qua bản tóm tắt (nguyên văn vẫn nằm trong bảng `messages` nhưng
 chưa có công cụ nào đọc ra); chưa có tìm kiếm theo từ khoá trên toàn bộ lịch sử.
@@ -357,8 +419,8 @@ Thêm provider mới: tạo lớp con `LLMProvider` gắn `@register_provider("t
 
 | File | Vai trò |
 |---|---|
-| `bot/main.py` | Khởi chạy, nhận tin tag bot / lệnh riêng, lưu tin (`ingest`), bù tin, lịch chạy (00:01, khởi động), thử lại |
-| `bot/userbot.py` | Userbot (Telethon): theo dõi tin mới / sửa, bù tin, tìm người dùng / nhóm, lọc tin không phải hội thoại |
+| `bot/main.py` | Khởi chạy, nhận tin tag bot / lệnh riêng, lưu tin (`ingest`), đồng bộ tin nhắn (`sync_chat`), lịch chạy (00:01, khởi động), thử lại |
+| `bot/userbot.py` | Userbot (Telethon): theo dõi tin mới / sửa, lấy tin để đồng bộ (`fetch_since`), tìm người dùng / nhóm, lọc tin không phải hội thoại |
 | `bot/userbot_login.py` | `python -m bot.userbot_login`: đăng nhập userbot, in session string |
 | `bot/summarizer.py` | Một lượt xử lý: bước A ghi task, bước B tóm tắt |
 | `bot/review.py` | Rà soát sheet khi khởi động |
@@ -398,6 +460,17 @@ và cài toga, keyring... theo `requires` trong `pyproject.toml`; không cài c�
 `requires`) rồi build lại. Bộ cài MSI cài theo người dùng (không cần quyền admin), tạo shortcut trong
 Start menu và trên màn hình chính (bỏ được bằng ô "Create a desktop shortcut" lúc cài; gỡ app thì shortcut
 tự mất). Logo: xem `resources/README.md`.
+
+`briefcase create` chỉ cài gói dạng wheel. Gói nào trên PyPI chỉ có bản mã nguồn thì báo lỗi kiểu
+`no matching distributions available for your environment: <gói>`. Hiện có `pyaes` (Telethon cần): wheel
+tự đóng sẵn nằm trong `packaging/wheels/`, `pyproject.toml` khai báo
+`requirement_installer_args = ["--find-links", "./packaging/wheels"]`. Gặp gói khác như vậy và gói đó thuần
+Python thì làm tương tự: `pip wheel <gói>==<phiên bản> --no-deps -w packaging/wheels`.
+
+Python cài từ Microsoft Store bị Windows "ảo hoá" thư mục `%LOCALAPPDATA%`: `briefcase dev` chạy bằng Python
+đó sẽ ghi cấu hình, `bot.db` và log vào
+`%LOCALAPPDATA%\Packages\PythonSoftwareFoundation.Python.3.12_...\LocalCache\Local\...` thay vì thư mục của
+bản đã cài, và không thấy bản đã cài đang chạy. Nên dùng Python từ python.org cho `.venv-app`.
 
 Bộ cài MSI chỉ nhận chữ trong code page 1252 (không có chữ tiếng Việt), nên mục `windows` trong
 `pyproject.toml` dùng `description` không dấu và giấy phép `LICENSE.rtf` (chữ có dấu viết dạng mã
@@ -482,6 +555,31 @@ docker logs -f tgbot
 
 Mỗi token chỉ nên có **một** bot chạy cùng lúc (chạy cả trên máy lẫn server sẽ bị lỗi `Conflict`).
 
+## Đo thời gian (tìm chỗ chậm)
+
+Bot ghi thời gian của từng đoạn xử lý vào log, mỗi dòng bắt đầu bằng `Thời gian - `. Lọc riêng các dòng này:
+`findstr /C:"Thời gian" bot.log` (Windows) hoặc `grep "Thời gian" bot.log`. Log không chứa nội dung tin
+nhắn, câu hỏi hay câu trả lời.
+
+| Dòng log | Ý nghĩa |
+|---|---|
+| `yêu cầu @bot <summarize> / <task> / hỏi đáp trong chat ... (tổng)` | Từ lúc nhận tin tag bot tới lúc gửi xong câu trả lời |
+| `câu hỏi trong chủ đề về chat ... (tổng, kèm N lượt trước)` | Một câu hỏi trong chủ đề `/p`, `/g` |
+| `chuẩn bị dữ liệu khi mở chủ đề ... (tổng)` | Đồng bộ tin nhắn + xử lý mọi ngày còn tin chưa xử lý, trước khi trả lời |
+| `hỏi đáp, chat ... (tổng các lượt LLM và công cụ)` | Phần LLM của một câu hỏi |
+| `gọi LLM (<việc>) lượt N, gửi X ký tự, kết quả: ...` | Một lần gọi model. Việc: hỏi đáp, ghi task, rà soát sheet. Nhiều lượt nối tiếp = chậm; X lớn = prompt dài |
+| `gọi LLM (tóm tắt), gửi X ký tự, bản tóm tắt mới Y ký tự` | Pha B: model viết lại cả bản tóm tắt của ngày, Y càng lớn càng lâu |
+| `công cụ <tên> (<việc>)` | Một công cụ model gọi (vd. `list_tasks` đọc Google Sheet) |
+| `pha A ghi task ... / pha B tóm tắt ... / xử lý tin nhắn ... (tổng hai pha)` | Một lượt xử lý tin nhắn của một ngày |
+| `đọc Google Sheet của chat ... (cả tab)`, `ghi Google Sheet: ...`, `tìm tab Google Sheet ...` | Gọi Google Sheets API |
+| `đồng bộ tin nhắn của chat ... (lấy từ Telegram)` | Userbot lấy tin chưa có trong DB |
+| `chờ khoá của chat ... (đang có lượt xử lý khác)` | Phải chờ lượt xử lý / rà soát khác của cùng chat xong (thường lúc khởi động) |
+| `chờ câu hỏi trước trong chủ đề ...` | Câu hỏi gửi khi câu trước (hoặc phần chuẩn bị dữ liệu) chưa xong |
+| `kiểm tra quyền sửa task (Telegram)`, `gửi câu trả lời (Telegram)`, `tìm người dùng / nhóm ...` | Gọi Telegram |
+| `việc khi khởi động (tổng)`, `khởi động - ...`, `chốt các ngày còn dở (tổng)` | Việc chạy theo lịch |
+
+Dòng có `(lỗi)` ở cuối: đoạn đó kết thúc vì lỗi (chi tiết lỗi ở dòng log ngay sau).
+
 ## Kiểm thử
 
 Trong `.venv` (bản dòng lệnh):
@@ -499,9 +597,9 @@ winreg được thay bằng bản giả trong `tests/fakes_desktop.py`.
 
 - Chỉ đọc tin nhắn văn bản và chú thích ảnh; chưa xử lý nội dung file, ảnh, voice.
 - Lần đầu theo dõi một chat, userbot chỉ lấy `USERBOT_HISTORY_DAYS` ngày gần nhất. Chế độ dự phòng
-  (không userbot): bot chỉ biết tin từ lúc được thêm vào nhóm, tin lúc bot tắt chỉ được Telegram gửi bù
-  tối đa 24 giờ.
-- Tin bị sửa lúc bot tắt không được cập nhật (bù tin chỉ lấy tin mới sau tin cuối đã lưu).
+  (không userbot): bot chỉ biết tin từ lúc được thêm vào nhóm, tin lúc bot tắt chỉ được Telegram gửi lại
+  trong vòng 24 giờ.
+- Tin bị sửa lúc bot tắt không được cập nhật (đồng bộ tin nhắn chỉ lấy tin mới hơn tin cuối đã lưu).
 - Nhóm thường (basic group, không phải supergroup): message id của bot và của userbot khác nhau, nên
   tin bot đã lưu ở chế độ dự phòng và tin userbot lấy về là hai bộ id riêng (không lưu lại tin cũ vì
   userbot chỉ lấy tin sau tin cuối đã lưu).
@@ -510,6 +608,6 @@ winreg được thay bằng bản giả trong `tests/fakes_desktop.py`.
 - Admin gửi ở chế độ ẩn danh thì bot không biết là ai nên không sửa task được; hãy tắt ẩn danh khi
   cần sửa.
 - Task chỉ lên sheet khi có lượt xử lý (vượt ngưỡng, `<summarize>`, lệnh riêng, khi khởi động, hoặc
-  00:01 hôm sau). Nén tự động khi vượt ngưỡng giữ lại 30 tin gần nhất cho lần sau; muốn xử lý ngay mọi
+  00:01 hôm sau). Xử lý tự động khi vượt ngưỡng giữ lại 30 tin gần nhất cho lần sau; muốn xử lý ngay mọi
   tin, dùng `@ten_bot <summarize>`.
 - Hỏi đáp chỉ đọc được nguyên văn các tin chưa xử lý; tin đã xử lý chỉ còn qua bản tóm tắt.

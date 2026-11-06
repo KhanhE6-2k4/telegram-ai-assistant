@@ -1,24 +1,28 @@
-"""Xử lý hội thoại trong ngày bằng LLM (provider bất kỳ), theo hai pha:
+"""Xử lý tin nhắn trong ngày bằng LLM (provider bất kỳ), theo hai pha:
 
 A. Ghi task: model đọc các task hiện có trên Google Sheet (định danh bằng STT) cùng các tin nhắn
    mới, rồi gọi công cụ add_task / update_task. Mỗi lệnh được ghi ngay vào sheet.
-B. Tóm tắt: model gộp tin nhắn mới vào bản tóm tắt của ngày (giống cách Claude nén cuộc trò chuyện dài).
+B. Tóm tắt: model gộp tin nhắn mới vào bản tóm tắt của ngày.
 
-Chỉ khi cả hai pha xong thì mốc compacted_until mới tiến lên. Nếu một pha lỗi, lần thử lại xử lý
-lại cùng các tin nhắn; vì model đọc lại sheet (đã có các dòng vừa ghi) nên không thêm task trùng.
+Chỉ khi cả hai pha xong thì mốc compacted_until (id tin cuối đã xử lý) mới tiến lên. Nếu một pha lỗi,
+lần thử lại xử lý lại cùng các tin nhắn; vì model đọc lại sheet (đã có các dòng vừa ghi) nên không thêm
+task trùng.
 """
 import asyncio
 import json
 import logging
+import time
 
 from .dates import DEADLINE_RULES, calendar_text
 from .providers import ChatMessage, LLMProvider, Tool, ToolCall, run_tool_loop
+from .providers.base import prompt_chars
 from .sheets import FIELDS, TaskSheet, is_general, is_marked
-from .storage import DaySummary, Message, Storage
+from .storage import BOT_NOTE_NAME, DaySummary, Message, Storage
+from .timing import log_elapsed, timed
 
 log = logging.getLogger(__name__)
 
-# Khi nén giữa ngày, giữ lại bấy nhiêu tin nhắn gần nhất ở dạng gốc để bot vẫn có ngữ cảnh chi tiết.
+# Khi xử lý giữa ngày, giữ lại bấy nhiêu tin nhắn gần nhất ở dạng gốc để bot vẫn có ngữ cảnh chi tiết.
 KEEP_RECENT_RAW = 30
 # Số task gần nhất (theo STT) đưa cho model để đối chiếu
 MAX_SHEET_ROWS_IN_PROMPT = 300
@@ -47,6 +51,10 @@ Quy tắc:
 - Task bị huỷ: update_task với progress = "Đã huỷ". Không bao giờ xoá task.
 - Dòng có người thực hiện "Tất cả" là lịch họp / thông báo chung (không phải task); dòng có nội dung
   "Trùng với task #..." là dòng trùng task khác. Không sửa các dòng này, không coi "Tất cả" là tên người.
+- Task có updated_day sau ngày {day} đã được cập nhật sau các tin nhắn này (ví dụ người dùng đã xác nhận
+  sửa, hoặc tin nhắn ngày sau): giữ nguyên giá trị trên sheet, không đổi lại theo tin nhắn cũ.
+- Tin nhắn của "{bot_note}" là ghi chú bot đã sửa task trên sheet theo xác nhận của người dùng: sheet đã có
+  thay đổi đó, không cần cập nhật lại, không tạo task mới từ ghi chú này.
 - Deadline: ghi dạng YYYY-MM-DD, để trống nếu không có. Ngày mốc là ngày gửi tin nhắn (ngày {day}).
 {deadline_rules}
 - Tin nhắn có nhãn "(đã sửa)" là nội dung đã được người gửi sửa lại; dùng nội dung mới.
@@ -100,6 +108,8 @@ Nhiệm vụ: cập nhật bản tóm tắt hội thoại của ngày {day}.
 - Tin nhắn có nhãn "(đã sửa)" là nội dung đã được sửa lại; nếu nó khác điều bản tóm tắt cũ ghi,
   hãy sửa bản tóm tắt cho đúng.
 - Task đã được ghi trên Google Sheet; trong tóm tắt chỉ cần nhắc ngắn (kèm STT nếu biết).
+- Tin nhắn của "{bot_note}" là ghi chú bot đã sửa task theo xác nhận của người dùng (ví dụ dời deadline):
+  ghi vào tóm tắt như một thay đổi đã thực hiện (ai xác nhận, task nào, đổi gì).
 - Không bịa thông tin không có trong chat."""
 
 SUMMARY_TOOL = Tool(
@@ -142,7 +152,10 @@ def _task_prompt(tasks: list[dict], current: DaySummary, messages: list[Message]
     ])
 
 
-async def run_task_tool(sheet: TaskSheet, name: str, args: dict, day: str) -> dict:
+async def run_task_tool(sheet: TaskSheet, name: str, args: dict, day: str, guard: bool = False) -> dict:
+    """Chạy add_task / update_task. `guard=True` (pha A ghi task từ tin nhắn của ngày `day`): update_task không
+    được sửa dòng đã đánh dấu ("Tất cả" / "Trùng với task #N"), và không được ghi đè task đã cập nhật sau
+    ngày `day` (tin nhắn cũ hơn thay đổi đó, ví dụ khi xử lý lại một ngày đã qua)."""
     if name == "add_task":
         if not str(args.get("assignee") or "").strip() or is_general(args.get("assignee")):
             # Không có người thực hiện cụ thể (lịch họp, thông báo chung...) thì không phải task
@@ -151,10 +164,17 @@ async def run_task_tool(sheet: TaskSheet, name: str, args: dict, day: str) -> di
         return {"stt": stt}
     if name == "update_task":
         changes = {k: v for k, v in (args.get("changes") or {}).items() if k in FIELDS}
-        if sheet.get(args["stt"]) is None:
+        task = next((t for t in sheet.rows() if t["stt"] == args["stt"]), None)
+        if task is None:
             return {"error": f"Không có task STT {args['stt']}"}
         if not changes:
             return {"error": "Không có trường nào để đổi"}
+        if guard and is_marked(task):
+            return {"error": f"Không sửa: dòng #{args['stt']} đã được đánh dấu là lịch / thông báo chung "
+                             "hoặc dòng trùng."}
+        if guard and task.get("updated_day") and task["updated_day"] > day:
+            return {"error": f"Không sửa: task #{args['stt']} đã được cập nhật ngày {task['updated_day']}, sau "
+                             f"ngày của các tin nhắn đang xử lý ({day}); không ghi đè bằng thông tin cũ hơn."}
         return {"stt": args["stt"], "values": await asyncio.to_thread(sheet.update, args["stt"], changes, day)}
     return {"error": f"Không có công cụ {name}"}
 
@@ -169,15 +189,18 @@ async def record_tasks(
     """
 
     async def execute(call: ToolCall) -> str:
-        return json.dumps(await run_task_tool(sheet, call.name, call.arguments, day), ensure_ascii=False)
+        return json.dumps(await run_task_tool(sheet, call.name, call.arguments, day, guard=True), ensure_ascii=False)
 
     answer = await run_tool_loop(
         llm,
-        system=TASK_SYSTEM_PROMPT.format(day=day, deadline_rules=DEADLINE_RULES, calendar=calendar_text(day)),
+        system=TASK_SYSTEM_PROMPT.format(
+            day=day, deadline_rules=DEADLINE_RULES, calendar=calendar_text(day), bot_note=BOT_NOTE_NAME
+        ),
         prompt=_task_prompt(sheet.rows(), current, messages),
         tools=TASK_TOOLS,
         execute=execute,
         max_rounds=MAX_TASK_ROUNDS,
+        purpose="ghi task",
     )
     if answer is None:
         raise RuntimeError("Model gọi công cụ quá nhiều vòng khi ghi task")
@@ -192,9 +215,12 @@ async def summarize(llm: LLMProvider, day: str, current: DaySummary, messages: l
         "## Tin nhắn mới",
         _format_messages(messages),
     ])
+    system = SUMMARY_SYSTEM_PROMPT.format(day=day, bot_note=BOT_NOTE_NAME)
+    messages = [ChatMessage.user(prompt)]
+    start = time.perf_counter()
     response = await llm.complete(
-        system=SUMMARY_SYSTEM_PROMPT.format(day=day),
-        messages=[ChatMessage.user(prompt)],
+        system=system,
+        messages=messages,
         tools=[SUMMARY_TOOL],
         tool_choice=SUMMARY_TOOL.name,
         max_tokens=8000,
@@ -202,11 +228,16 @@ async def summarize(llm: LLMProvider, day: str, current: DaySummary, messages: l
     call = next((c for c in response.tool_calls if c.name == SUMMARY_TOOL.name), None)
     if call is None or "summary" not in call.arguments:
         raise RuntimeError("Model không trả về bản tóm tắt")
+    # Model viết lại cả bản tóm tắt của ngày: bản tóm tắt càng dài, lượt này càng lâu
+    log_elapsed(
+        log, start, "gọi LLM (tóm tắt), gửi %d ký tự, bản tóm tắt mới %d ký tự",
+        prompt_chars(system, messages), len(call.arguments["summary"]),
+    )
     return call.arguments["summary"]
 
 
 def messages_to_process(storage: Storage, current: DaySummary, keep_recent: int) -> list[Message]:
-    """Các tin cần xử lý, trừ `keep_recent` tin chưa nén gần nhất (giữ ở dạng gốc làm ngữ cảnh)."""
+    """Các tin cần xử lý, trừ `keep_recent` tin chưa xử lý gần nhất (giữ ở dạng gốc làm ngữ cảnh)."""
     pending = storage.pending_messages(current.chat_id, current.day, current.compacted_until)
     if keep_recent <= 0:
         return pending
@@ -224,10 +255,10 @@ async def process_day(
     finalize: bool = False,
     keep_recent: bool = True,
 ) -> DaySummary | None:
-    """Ghi task lên sheet rồi nén các tin nhắn chưa xử lý của ngày vào bản tóm tắt.
+    """Xử lý tin nhắn chưa xử lý của ngày: ghi task lên sheet rồi gộp các tin vào bản tóm tắt.
 
     finalize=False (giữa ngày): ngày chưa chốt. Mặc định giữ lại KEEP_RECENT_RAW tin nhắn gần nhất
-      ở dạng gốc (nén tự động khi vượt ngưỡng); keep_recent=False thì xử lý hết (lệnh /tomtat).
+      ở dạng gốc (xử lý tự động khi vượt ngưỡng); keep_recent=False thì xử lý hết (@bot <summarize>).
     finalize=True (chốt ngày): xử lý toàn bộ và đánh dấu ngày đã chốt.
     Trả về None nếu không có gì để xử lý. Lỗi (LLM hoặc Google Sheet) được ném ra để gọi lại.
     """
@@ -239,8 +270,14 @@ async def process_day(
             storage.save_summary(current)
         return None
 
-    await record_tasks(sheet, llm, day, current, batch)
-    summary = await summarize(llm, day, current, batch)
+    label = storage.chat_label(chat_id)
+    start = time.perf_counter()
+    with timed(
+        log, "pha A ghi task, chat %s ngày %s (%d tin, sheet %d dòng)", label, day, len(batch), len(sheet.rows())
+    ):
+        await record_tasks(sheet, llm, day, current, batch)
+    with timed(log, "pha B tóm tắt, chat %s ngày %s (%d tin)", label, day, len(batch)):
+        summary = await summarize(llm, day, current, batch)
 
     updated = DaySummary(
         chat_id=chat_id,
@@ -251,7 +288,8 @@ async def process_day(
     )
     storage.save_summary(updated)
     storage.clear_edit_pending([m.id for m in batch if m.edit_pending])
-    log.info("Đã xử lý %d tin nhắn của chat %s ngày %s", len(batch), storage.chat_label(chat_id), day)
+    log.info("Đã xử lý %d tin nhắn của chat %s ngày %s", len(batch), label, day)
+    log_elapsed(log, start, "xử lý tin nhắn, chat %s ngày %s (tổng hai pha)", label, day)
     return updated
 
 

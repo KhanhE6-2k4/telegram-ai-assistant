@@ -117,3 +117,25 @@ def test_add_task_with_general_assignee_is_rejected():
                                     {"name": "Họp", "assignee": "tất cả", "description": "", "progress": "", "deadline": ""},
                                     TODAY))
     assert "error" in out and len(ws.rows) == 1
+
+
+def test_bot_write_keeps_sheet_reviewed_but_manual_edit_does_not():
+    from bot.review import fingerprint, refresh_after_bot_write
+    from tests.test_sheets import task
+
+    s, ws = Storage(":memory:"), FakeWorksheet()
+    sheet = TaskSheet(ws, s, -1)
+    sheet.add(task("Báo cáo"), "2026-10-27")
+    s.save_review(-1, fingerprint(sheet.rows()))  # đã rà soát
+
+    before = sheet.rows()
+    sheet.add(task("Slide", assignee="Lan"), "2026-10-28")  # bot ghi khi xử lý tin nhắn
+    refresh_after_bot_write(s, -1, before, sheet.rows())
+    assert s.review_fingerprint(-1) == fingerprint(sheet.rows())  # khởi động sau: bỏ qua rà soát
+
+    ws.rows[1][1] = "Báo cáo (sửa tay)"  # người dùng sửa tay trên sheet
+    sheet = TaskSheet(ws, s, -1)
+    before = sheet.rows()
+    sheet.add(task("Họp", assignee="Minh"), "2026-10-29")
+    refresh_after_bot_write(s, -1, before, sheet.rows())
+    assert s.review_fingerprint(-1) != fingerprint(sheet.rows())  # vẫn rà lại vì có sửa tay

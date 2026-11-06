@@ -180,7 +180,7 @@ def test_finalize_with_nothing_pending_only_marks_day():
 
 
 def test_late_message_reopens_finalized_day():
-    """Tin của ngày đã chốt về muộn (Telegram gửi bù lúc bot chạy lại) mở lại ngày đó để chốt lại."""
+    """Tin của ngày đã chốt về muộn (tin gửi lúc bot tắt, đồng bộ khi bot chạy lại) mở lại ngày đó để chốt lại."""
     s, ws = Storage(":memory:"), FakeWorksheet()
     add(s, 2, day="2026-10-28")
     run(s, ws, FakeClaude(), day="2026-10-28", finalize=True)
@@ -219,3 +219,29 @@ def test_migrates_old_database(tmp_path):
     add(s, 1)
     assert s.pending_messages(-100, DAY, 0)[0].edit_pending == 0
     assert s.task_days(-100) == {1: ("2026-10-27", "2026-10-28")}
+
+
+# ---- pha A không ghi đè thay đổi mới hơn / dòng đã đánh dấu ----
+
+def test_phase_a_does_not_touch_marked_rows_or_newer_changes():
+    from bot.summarizer import run_task_tool
+
+    s, ws = Storage(":memory:"), FakeWorksheet()
+    sheet = TaskSheet(ws, s, -100)
+    sheet.add(task("Báo cáo Q3", assignee="Lan", deadline="2026-10-30"), "2026-10-29")
+    sheet.add(task("Họp nhanh", assignee="Tất cả"), "2026-10-29")  # dòng đã đánh dấu: lịch họp chung
+    sheet.update(1, {"deadline": "2026-11-10"}, "2026-11-05")  # người dùng xác nhận dời hạn ngày 05/11
+
+    def update(stt, changes, day, guard=True):
+        return asyncio.run(run_task_tool(sheet, "update_task", {"stt": stt, "changes": changes}, day, guard=guard))
+
+    # Xử lý lại tin ngày 29/10 ("deadline 30/10"): không đổi ngược lại
+    out = update(1, {"deadline": "2026-10-30"}, "2026-10-29")
+    assert "cập nhật ngày 2026-11-05" in out["error"]
+    assert sheet.get(1)["deadline"] == "2026-11-10"
+    # Dòng đã đánh dấu: pha A không sửa
+    assert "đã được đánh dấu" in update(2, {"assignee": "Minh"}, "2026-11-06")["error"]
+    # Tin cùng ngày hoặc mới hơn: sửa bình thường
+    assert update(1, {"progress": "Đang làm"}, "2026-11-06")["values"]["progress"] == "Đang làm"
+    # Rà soát sheet (guard=False) vẫn sửa được dòng đã đánh dấu
+    assert update(2, {"deadline": "2026-10-29"}, "2026-11-06", guard=False)["values"]["deadline"] == "2026-10-29"
